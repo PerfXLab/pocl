@@ -27,6 +27,7 @@
 #include <stdlib.h>
 
 #include "pocl_opencl.h"
+#include <stdlib.h>
 
 #ifdef _WIN32
 #define POCLU_CALL __cdecl
