@@ -119,7 +119,6 @@ endmacro()
 find_program(BASH "bash")
 find_program(MAKE_PROGRAM NAMES "make")
 find_program(GIT_CMD "git")
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set_expr(HAVE_GIT GIT_CMD)
 
 if(HAVE_GIT)
@@ -167,12 +166,7 @@ endif()
 
 ##################################################################################
 
-if(DEFINED OCS_AVAILABLE)
-  message(WARNING "The OCS_AVAILABLE option is deprecated, since it actually meant 'LLVM available', but LLVM is not the only way to get compiler support in a device. Please use ENABLE_LLVM in future if you want to enable/disable building pocl against LLVM.")
-  set(ENABLE_LLVM ${OCS_AVAILABLE} CACHE BOOL "build against LLVM" FORCE)
-else()
-  option(ENABLE_LLVM "Build pocl with LLVM. Default is ON." ON)
-endif()
+option(ENABLE_LLVM "Build pocl with LLVM. Default is ON." ON)
 
 option(STATIC_LLVM "If ON, link to static LLVM libraries. OFF (default) = link to shared LLVM libraries." OFF)
 
@@ -187,6 +181,8 @@ option(ENABLE_LOADABLE_DRIVERS "Enable drivers to be dlopen()-ed at pocl runtime
 option(ENABLE_HSA "Enable the HSA base profile runtime device driver" OFF)
 
 option(ENABLE_CUDA "Enable the CUDA device driver for NVIDIA devices" OFF)
+
+option(ENABLE_CUDNN "Enable the CUDNN for the CUDA device driver, requires CUDA" OFF)
 
 option(ENABLE_VULKAN "Experimental and incomplete driver that uses the Vulkan API for controlling the device. Please refer to the user manual for the status and open tasks" OFF)
 
@@ -247,7 +243,7 @@ option(EXAMPLES_USE_GIT_MASTER "If enabled, some of the external testsuites in e
 
 option(ENABLE_HOST_CPU_DEVICES "Add host CPUs as OpenCL devices (basic and pthread)." ON)
 
-option(ENABLE_ACCEL_DEVICE "Enable the generic hardware accelerator device driver." OFF)
+option(ENABLE_ALMAIF_DEVICE "Enable the generic hardware accelerator device driver." OFF)
 
 option(ENABLE_POCLCC "Build poclcc. Defaults to ON" ON)
 
@@ -307,17 +303,36 @@ else()
 endif()
 message(STATUS "Host CPU cores: ${CORECOUNT}")
 
+
 ######################################################################################
 
-function(rename_if_different SRC DST)
+function(chmod FILE EXEC)
+  if(EXEC)
+    set(PERMS FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+  else()
+    #set(PERMS FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    return()
+  endif()
+  if(CMAKE_VERSION VERSION_LESS 3.19.0)
+    find_program(CHMOD_PROG chmod)
+    execute_process(COMMAND "${CHMOD_PROG}" "0755" ${FILE})
+  else()
+    file(CHMOD "${FILE}" ${PERMS})
+  endif()
+endfunction()
+
+
+function(rename_if_different SRC DST EXEC)
   if(EXISTS "${DST}")
     file(MD5 "${SRC}" OLD_MD5)
     file(MD5 "${DST}" NEW_MD5)
     if(NOT OLD_MD5 STREQUAL NEW_MD5)
       file(RENAME "${SRC}" "${DST}")
+      chmod("${DST}" ${EXEC})
     endif()
   else()
     file(RENAME "${SRC}" "${DST}")
+    chmod("${DST}" ${EXEC})
   endif()
 endfunction()
 
@@ -469,7 +484,7 @@ if(ENABLE_LLVM)
     set(WITH_TCE ENV PATH)
   endif()
 
-  find_program(TCE_CONFIG NAMES "tce-config" HINTS ${WITH_TCE})
+  find_program(TCE_CONFIG NAMES "openasip-config" "tce-config" HINTS ${WITH_TCE})
   find_program(TCECC NAMES "tcecc" HINTS ${WITH_TCE})
   find_program(TTASIM NAMES "ttasim" HINTS ${WITH_TCE})
 
@@ -487,6 +502,41 @@ if(ENABLE_LLVM)
     set(HOST_CPU_FORCED 1 CACHE INTERNAL "CPU is forced by user" FORCE)
     set(LLC_HOST_CPU "skylake-avx512" CACHE STRING "The Host CPU to use with llc" FORCE)
   endif()
+  endif()
+
+  #
+  # LLVM_OPAQUE_POINTERS
+  #
+  # llvm has changed from typed pointers to opaque pointers, their guidance is
+  #
+  # From https://llvm.org/docs/OpaquePointers.html, version support
+  # LLVM 14: Supports all necessary APIs for migrating to opaque pointers and deprecates/removes
+  #          incompatible APIs. However, using opaque pointers in the optimization pipeline is not fully
+  #          supported. This release can be used to make out-of-tree code compatible with opaque
+  #          pointers, but opaque pointers should not be enabled in production.
+  #
+  # LLVM 15: Opaque pointers are enabled by default. Typed pointers are still available, but only
+  #          supported on a best-effort basis and may be untested.
+  #
+  # LLVM 16: Only opaque pointers will be supported. Typed pointers will not be supported.
+  #
+  # Up to llvm 14 including, ENABLE_LLVM_OPAQUE_POINTERS is force-set to OFF
+  # Post llvm 15, ENABLE_LLVM_OPAQUE_POINTERS is force-set to ON
+  # For llvm 15 ENABLE_LLVM_OPAQUE_POINTERS is a CMake option, defaulting to OFF,
+  # reason is that 1) it's unfinished 2) for properly handling images, we need opaque types,
+  # which will only be available in LLVM 16+
+  # TODO: This should be temporary. After the opaque pointer conversion in PoCL is finished,
+  # we should remove this macro and use LLVM_OLDER_THAN_X macros only, like in the rest
+  # of the code, since this macro adds another layer of complexity.
+  if(LLVM_VERSION VERSION_LESS_EQUAL 14.0)
+    set(ENABLE_LLVM_OPAQUE_POINTERS OFF CACHE INTERNAL "llvm opaque pointers" FORCE)
+  elseif(LLVM_VERSION VERSION_EQUAL 15.0)
+    option(ENABLE_LLVM_OPAQUE_POINTERS "Handle the change to llvm opaque pointers." OFF)
+  else()
+    set(ENABLE_LLVM_OPAQUE_POINTERS ON CACHE INTERNAL "llvm opaque pointers" FORCE)
+  endif()
+  if (ENABLE_LLVM_OPAQUE_POINTERS)
+    set(LLVM_OPAQUE_POINTERS 1)
   endif()
 
 else()
@@ -706,8 +756,12 @@ if(NOT DEFINED DEFAULT_ENABLE_IPO)
 
   if(NOT CMAKE_VERSION VERSION_LESS "3.9")
 
-    include(CheckIPOSupported)
-    check_ipo_supported(RESULT IPO OUTPUT IPO_OUTPUT)
+    if(DEVELOPER_MODE)
+      set(IPO 0)
+    else()
+      include(CheckIPOSupported)
+      check_ipo_supported(RESULT IPO OUTPUT IPO_OUTPUT)
+    endif()
     set(DEFAULT_ENABLE_IPO ${IPO} CACHE BOOL "IPO" FORCE)
 
     message(STATUS "Compiler supports IPO: ${DEFAULT_ENABLE_IPO}")
@@ -718,6 +772,12 @@ endif()
 setup_cached_var(ENABLE_IPO "Enable Link-Time Optimization (IPO) while building pocl runtime"
   "Requested build with IPO, but IPO is not available"
   "IPO available, but requested build without it")
+
+if(HAVE_VALGRIND)
+  option(ENABLE_VALGRIND "Enable valgrind support (this may slow down PoCL)" OFF)
+else()
+  set(ENABLE_VALGRIND OFF CACHE BOOL "valgrind is not available" FORCE)
+endif()
 
 ######################################################################################
 
@@ -749,6 +809,15 @@ if(ENABLE_POCL_FLOAT_CONVERSION)
   set(FLOATCONV_FLAG "-DENABLE_POCL_FLOAT_CONVERSION")
 endif()
 
+unset(OPAQUE_PTR_FLAGS)
+if(LLVM_VERSION VERSION_EQUAL 15.0)
+  if(LLVM_OPAQUE_POINTERS)
+    set(OPAQUE_PTR_FLAGS "-Xclang -opaque-pointers")
+  else()
+    set(OPAQUE_PTR_FLAGS "-Xclang -no-opaque-pointers")
+  endif()
+endif()
+
 ######################################################################################
 
 # for kernel code, disable PIC & stack protector
@@ -758,9 +827,10 @@ endif()
 # constant addrspace variables, and stack protector likely slows
 # down the kernels, so it needs to be determined whether it's worth
 # the trouble.
-set(DEFAULT_KERNEL_CL_FLAGS  "-xcl -fno-stack-protector -fPIC ${FLOATCONV_FLAG}")
-set(DEFAULT_KERNEL_C_FLAGS "-xc -std=c11 -D__CBUILD__ -fno-math-errno -fno-stack-protector -fPIC ${FLOATCONV_FLAG}")
-set(DEFAULT_KERNEL_CXX_FLAGS "-xc++ -std=c++11 -fno-stack-protector -fPIC ${FLOATCONV_FLAG}")
+set(DEFAULT_KERNEL_CL_FLAGS  "-xcl -fno-stack-protector -fPIC ${FLOATCONV_FLAG} ${OPAQUE_PTR_FLAGS}")
+set(DEFAULT_KERNEL_C_FLAGS "-xc -std=c11 -D__CBUILD__ -fno-math-errno -fno-stack-protector -fPIC ${FLOATCONV_FLAG} ${OPAQUE_PTR_FLAGS}")
+set(DEFAULT_KERNEL_CXX_FLAGS "-xc++ -std=c++11 -fno-stack-protector -fPIC ${FLOATCONV_FLAG} ${OPAQUE_PTR_FLAGS}")
+
 
 set(EXTRA_KERNEL_FLAGS "" CACHE STRING "Extra arguments to all kernel compilation commands (defaults to empty)")
 set(EXTRA_KERNEL_CL_FLAGS "" CACHE STRING "Extra arguments to kernel CL compiler (defaults to empty)")
@@ -816,19 +886,21 @@ endif()
 
 if(ENABLE_SPIR)
 
-  message(WARNING "SPIR support is available but highly experimental; use at your own risk.")
-
   if(LLVM_SPIRV AND (EXISTS "${LLVM_SPIRV}"))
-    message(WARNING "SPIR-V support enabled but highly experimental; you must use a llvm-spirv "
-      "converter that produces bitcode FOR YOUR LLVM VERSION. "
-      "E.g. if you're compiling pocl against LLVM 5 then using Khronos' "
-      "llvm-spirv based on LLVM 3.6 branch WILL NOT WORK.")
-    set(SPIRV ON)
+    option(ENABLE_SPIRV "Enable SPIR-V support (default ON when available)" ON)
+  else()
+    set(ENABLE_SPIRV OFF CACHE INTERNAL "SPIR-V enabled" FORCE)
+  endif()
+
+  # required for the wrapper generator
+  if(CMAKE_VERSION VERSION_LESS 3.12.0)
+    find_program(Python3_EXECUTABLE NAMES "python3" REQUIRED)
+  else()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
   endif()
 
 endif()
 
-set(ENABLE_SPIRV ${SPIRV} CACHE INTERNAL "SPIR-V enabled" FORCE)
 
 ######################################################################################
 
@@ -1135,40 +1207,6 @@ else()
   set(HOST_DEVICE_CL_VERSION_MINOR 2)
 endif()
 
-#
-# LLVM_OPAQUE_POINTERS
-#
-# llvm has changed from typed pointers to opaque pointers, their guidance is
-#
-# From https://llvm.org/docs/OpaquePointers.html, version support
-# LLVM 14: Supports all necessary APIs for migrating to opaque pointers and deprecates/removes
-#          incompatible APIs. However, using opaque pointers in the optimization pipeline is not fully
-#          supported. This release can be used to make out-of-tree code compatible with opaque
-#          pointers, but opaque pointers should not be enabled in production.
-#
-# LLVM 15: Opaque pointers are enabled by default. Typed pointers are still available, but only
-#          supported on a best-effort basis and may be untested.
-#
-# LLVM 16: Only opaque pointers will be supported. Typed pointers will not be supported.
-#
-# Pre llvm 14, ENABLE_LLVM_OPAQUE_POINTERS will not be defined and the legacy typed pointers will be used.
-# Post llvm 15, ENABLE_LLVM_OPAQUE_POINTERS will not be defined and opaque pointers will be used.
-# For llvm 14 and 15 this macro will be controlled by the build parameter ENABLE_LLVM_OPAQUE_POINTERS
-# For llvm 14 it will default to OFF
-# For llvm 15 it will default to  ON
-if(LLVM_VERSION VERSION_LESS_EQUAL 13.0)
-  set(ENABLE_LLVM_OPAQUE_POINTERS 0)
-elseif(LLVM_VERSION VERSION_EQUAL 14.0)
-  option(ENABLE_LLVM_OPAQUE_POINTERS "Handle the change to llvm opaque pointers." OFF)
-elseif(LLVM_VERSION VERSION_EQUAL 15.0)
-  option(ENABLE_LLVM_OPAQUE_POINTERS "Handle the change to llvm opaque pointers." ON)
-else()
-  set(ENABLE_LLVM_OPAQUE_POINTERS 1)
-endif()
-if (ENABLE_LLVM_OPAQUE_POINTERS)
-  set(LLVM_OPAQUE_POINTERS 1)
-endif()
-
 # These are mandatory for OpenCL 1.1 (except for 3D writes and command buffers
 # but those are CPU-independent)
 set(HOST_DEVICE_EXTENSIONS "cl_khr_byte_addressable_store cl_khr_global_int32_base_atomics \
@@ -1291,11 +1329,36 @@ if(ENABLE_HOST_CPU_DEVICES)
   set(BUILD_PTHREAD 1)
 endif()
 
-# The accel device could be built by default, but it's implemented in C++,
+# The almaif device could be built by default, but it's implemented in C++,
 # thus requires a C++ compiler, so let's not.
-if(ENABLE_ACCEL_DEVICE)
-  set(BUILD_ACCEL 1)
-  set(OCL_DRIVERS "${OCL_DRIVERS} accel")
+if(ENABLE_ALMAIF_DEVICE)
+
+  if(NOT HAVE_XRT AND DEFINED ENV{XILINX_XRT})
+    set(XRT $ENV{XILINX_XRT})
+
+    if(NOT XRT_INCLUDEDIR)
+      if(EXISTS "${XRT}/include/xrt")
+        set(XRT_INCLUDEDIR "${XRT}/include/xrt" CACHE PATH "XRT include dir")
+      else()
+        message(FATAL_ERROR "please provide -DXRT_INCLUDEDIR=... to CMake")
+      endif()
+    endif()
+
+    if(NOT XRT_LIBDIR)
+      if (EXISTS "${XRT}/lib")
+       set(XRT_LIBDIR "${XRT}/lib" CACHE PATH "XRT library dir")
+      else()
+        message(FATAL_ERROR "please provide -DXRT_LIBDIR=... to CMake")
+      endif()
+    endif()
+
+    if(XRT_INCLUDEDIR AND XRT_LIBDIR)
+      set(HAVE_XRT 1 CACHE BOOL "have XRT")
+    endif()
+  endif()
+
+  set(BUILD_ALMAIF 1)
+  set(OCL_DRIVERS "${OCL_DRIVERS} almaif")
 endif()
 
 if(DEFINED EXTRA_OCL_TARGETS)
@@ -1349,10 +1412,10 @@ if(NOT DEFINED DEFAULT_ENABLE_TCE)
 
   if(TCE_CONFIG AND TCECC AND TTASIM)
 
-    message(STATUS "Found tcecc + tce-config + ttasim, testing setup")
+    message(STATUS "Found tcecc + openasip-config + ttasim, testing setup")
 
     get_filename_component(TCE_BASEDIR "${TCE_CONFIG}" DIRECTORY)
-    find_library(TCE_LIBS "tce" HINTS "${TCE_BASEDIR}/../lib" ENV PATH)
+    find_library(TCE_LIBS "openasip" "tce" HINTS "${TCE_BASEDIR}/../lib" ENV PATH)
     if(NOT TCE_LIBS)
       execute_process(COMMAND "${TCE_CONFIG}" --libs OUTPUT_VARIABLE TCE_LIBS RESULT_VARIABLE RESV1 OUTPUT_STRIP_TRAILING_WHITESPACE)
     endif()
@@ -1365,11 +1428,11 @@ if(NOT DEFINED DEFAULT_ENABLE_TCE)
 
 
     if(NOT (LLVM_CONFIG STREQUAL TCE_LLVM_CONFIG))
-      message(WARNING "tce-config returned llvm-config is ${TCE_LLVM_CONFIG} but LLVM_CONFIG given to pocl is ${LLVM_CONFIG}")
+      message(WARNING "openasip-config returned llvm-config is ${TCE_LLVM_CONFIG} but LLVM_CONFIG given to pocl is ${LLVM_CONFIG}")
     endif()
 
     if (RESV1 OR RESV2 OR RESV3 OR RESV4 OR RESV5)
-      message(WARNING "tce-config: Nonzero exit status, disabling TCE")
+      message(WARNING "openasip-config: Nonzero exit status, disabling TCE")
     elseif (RESV9)
       message(WARNING "ttasim: Nonzero exit status, disabling TCE")
     else()
@@ -1397,7 +1460,7 @@ if(NOT DEFINED DEFAULT_ENABLE_TCE)
     endif()
 
   else()
-    message(STATUS "Failed to find tcecc or tce-config, disabling TCE")
+    message(STATUS "Failed to find tcecc or openasip-config, disabling TCE")
   endif()
 
   set(DEFAULT_ENABLE_TCE ${HAVE_TCE} CACHE INTERNAL "TCE available")
@@ -1504,6 +1567,9 @@ if(ENABLE_CUDA)
   set(CUDA_DEVICE_EXTENSIONS "cl_khr_byte_addressable_store cl_khr_global_int32_base_atomics cl_khr_global_int32_extended_atomics cl_khr_local_int32_base_atomics cl_khr_local_int32_extended_atomics cl_khr_fp64 cl_khr_int64_base_atomics cl_khr_int64_extended_atomics cl_nv_device_attribute_query")
   if(ENABLE_SPIR)
     set(CUDA_DEVICE_EXTENSIONS "${CUDA_DEVICE_EXTENSIONS} cl_khr_spir")
+  endif()
+  if(ENABLE_CUDNN)
+    add_definitions(-DENABLE_CUDNN=1)
   endif()
   if(ENABLE_SPIRV)
     set(CUDA_DEVICE_EXTENSIONS "${CUDA_DEVICE_EXTENSIONS} cl_khr_il_program")
@@ -1644,13 +1710,16 @@ set(TCEMC_AVAILABLE ${ENABLE_TCEMC})
 set(_CL_DISABLE_HALF ${CL_DISABLE_HALF})
 
 configure_file("config.h.in.cmake" "config.h.new" ESCAPE_QUOTES)
-rename_if_different("${CMAKE_BINARY_DIR}/config.h.new" "${CMAKE_BINARY_DIR}/config.h")
+rename_if_different("${CMAKE_BINARY_DIR}/config.h.new" "${CMAKE_BINARY_DIR}/config.h" 0)
 
 configure_file("config2.h.in.cmake" "config2.h.new")
-rename_if_different("${CMAKE_BINARY_DIR}/config2.h.new" "${CMAKE_BINARY_DIR}/config2.h")
+rename_if_different("${CMAKE_BINARY_DIR}/config2.h.new" "${CMAKE_BINARY_DIR}/config2.h" 0)
 
 configure_file("pocl_opencl.h.in.cmake" "pocl_opencl.h.new")
-rename_if_different("${CMAKE_BINARY_DIR}/pocl_opencl.h.new" "${CMAKE_BINARY_DIR}/pocl_opencl.h")
+rename_if_different("${CMAKE_BINARY_DIR}/pocl_opencl.h.new" "${CMAKE_BINARY_DIR}/pocl_opencl.h" 0)
+
+configure_file("cl_offline_compiler.sh.in.cmake" "cl_offline_compiler.sh.in.new" @ONLY)
+rename_if_different("${CMAKE_BINARY_DIR}/cl_offline_compiler.sh.in.new" "${CMAKE_BINARY_DIR}/cl_offline_compiler.sh" 1)
 
 include_directories("${CMAKE_BINARY_DIR}")
 
@@ -1761,7 +1830,7 @@ if(ENABLE_TESTS)
 
     # make check & make check_tier1
     add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND} "--output-on-failure" -j ${CORECOUNT} ${COMMAND_USES_TERMINAL})
-    add_custom_target(check_tier1 COMMAND ${CMAKE_CTEST_COMMAND} "--output-on-failure" -L "'internal|piglit|PyOpenCL|conformance_suite_micro|CLBlast|shoc'" -j ${CORECOUNT} ${COMMAND_USES_TERMINAL})
+    add_custom_target(check_tier1 COMMAND ${CMAKE_CTEST_COMMAND} "--output-on-failure" -L "'internal|piglit|PyOpenCL|conformance_suite_micro|shoc'" -j ${CORECOUNT} ${COMMAND_USES_TERMINAL})
 endif()
 
 if(ENABLE_EXAMPLES)
@@ -1929,12 +1998,16 @@ MESSAGE(STATUS "ENABLE_ICD: ${ENABLE_ICD}")
 MESSAGE(STATUS "ENABLE_TCE: ${ENABLE_TCE}")
 MESSAGE(STATUS "ENABLE_TCEMC: ${ENABLE_TCEMC}")
 MESSAGE(STATUS "ENABLE_HSA: ${ENABLE_HSA}")
+MESSAGE(STATUS "ENABLE_ALMAIF_DEVICE: ${ENABLE_ALMAIF_DEVICE}")
 MESSAGE(STATUS "ENABLE_CUDA: ${ENABLE_CUDA}")
+MESSAGE(STATUS "ENABLE_CUDNN: ${ENABLE_CUDNN}")
+MESSAGE(STATUS "ENABLE_HOST_CPU_DEVICES: ${ENABLE_HOST_CPU_DEVICES}")
 MESSAGE(STATUS "ENABLE_VULKAN: ${ENABLE_VULKAN}")
 MESSAGE(STATUS "ENABLE_ASAN (address sanitizer): ${ENABLE_ASAN}")
 MESSAGE(STATUS "ENABLE_LSAN (leak sanitizer): ${ENABLE_LSAN}")
 MESSAGE(STATUS "ENABLE_TSAN (thread sanitizer): ${ENABLE_TSAN}")
 MESSAGE(STATUS "ENABLE_UBSAN (UB sanitizer): ${ENABLE_UBSAN}")
+MESSAGE(STATUS "ENABLE_POCL_BUILDING: ${ENABLE_POCL_BUILDING}")
 MESSAGE(STATUS "ENABLE_POCL_FLOAT_CONVERSION: ${ENABLE_POCL_FLOAT_CONVERSION}")
 MESSAGE(STATUS "ENABLE_RELOCATION: ${ENABLE_RELOCATION}")
 MESSAGE(STATUS "ENABLE_PROXY_DEVICE: ${ENABLE_PROXY_DEVICE}")
@@ -1945,7 +2018,7 @@ MESSAGE(STATUS "ENABLE_EGL_INTEROP: ${ENABLE_EGL_INTEROP}")
 MESSAGE(STATUS "ENABLE_SLEEF: ${ENABLE_SLEEF}")
 MESSAGE(STATUS "ENABLE_SPIR: ${ENABLE_SPIR}")
 MESSAGE(STATUS "ENABLE_SPIRV: ${ENABLE_SPIRV}")
-MESSAGE(STATUS "ENABLE_POCL_BUILDING: ${ENABLE_POCL_BUILDING}")
+MESSAGE(STATUS "ENABLE_VALGRIND: ${ENABLE_VALGRIND}")
 MESSAGE(STATUS "INSTALL_OPENCL_HEADERS (Install our headers): ${INSTALL_OPENCL_HEADERS}")
 MESSAGE(STATUS "OCL_DRIVERS (Drivers built): ${OCL_DRIVERS}")
 MESSAGE(STATUS "OCL_TARGETS (Targets built): ${OCL_TARGETS}")

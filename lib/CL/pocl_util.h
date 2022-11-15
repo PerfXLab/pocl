@@ -279,6 +279,21 @@ int pocl_fill_aligned_buf_with_pattern (void *__restrict__ ptr, size_t offset,
                                         const void *__restrict__ pattern,
                                         size_t pattern_size);
 
+POCL_EXPORT
+int pocl_get_private_datadir (char* private_datadir);
+
+POCL_EXPORT
+int pocl_get_srcdir_or_datadir (char* path,
+                                const char* srcdir_suffix,
+                                const char *datadir_suffix,
+                                const char* filename);
+
+POCL_EXPORT
+void pocl_str_toupper (char *out, const char *in);
+
+POCL_EXPORT
+void pocl_str_tolower (char *out, const char *in);
+
 #ifdef __cplusplus
 }
 #endif

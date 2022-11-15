@@ -25,6 +25,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <time.h>
 
@@ -53,6 +54,16 @@
 #include "pocl_timing.h"
 #include "pocl_util.h"
 #include "utlist.h"
+
+#ifdef ENABLE_RELOCATION
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+#ifdef __linux__
+#define _GNU_SOURCE
+#endif
+#include <dlfcn.h>
+#endif
 
 /* required for setting SSE/AVX flush denorms to zero flag */
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -582,13 +593,24 @@ can_run_command (cl_device_id dev, size_t num_objs, cl_mem *objs)
 
   for (i = 0; i < num_objs; ++i)
     {
+      POCL_LOCK_OBJ (objs[i]);
       pocl_mem_identifier *p = &objs[i]->device_ptrs[dev->global_mem_id];
       // skip already allocated
-      if (p->mem_ptr)
+      if (p->mem_ptr) {
+        POCL_UNLOCK_OBJ (objs[i]);
         continue;
+      }
 
       assert (dev->ops->alloc_mem_obj);
       errcode = dev->ops->alloc_mem_obj (dev, objs[i], NULL);
+      if (errcode != CL_SUCCESS) {
+        POCL_UNLOCK_OBJ (objs[i]);
+        POCL_MSG_ERR("Failed to allocate %zx bytes on device %s\n",
+                     objs[i]->size, dev->short_name);
+        return CL_OUT_OF_RESOURCES;
+      }
+
+      POCL_UNLOCK_OBJ (objs[i]);
       if (errcode != CL_SUCCESS)
         return CL_FALSE;
     }
@@ -2463,6 +2485,80 @@ pocl_escape_quoted_whitespace (char *temp_options, char *replace_me)
   }
 
   return 0;
+}
+
+/* returns private datadir, possibly using relative path to libpocl sharedlib */
+int pocl_get_private_datadir(char* private_datadir)
+{
+#ifdef ENABLE_RELOCATION
+    Dl_info info;
+    if (dladdr((void*)pocl_get_private_datadir, &info))
+    {
+        char const *soname = info.dli_fname;
+        strcpy(private_datadir, soname);
+        char* last_slash = strrchr (private_datadir,'/');
+        if (last_slash)
+          {
+            ++last_slash;
+            *last_slash = 0;
+            strcat (private_datadir, POCL_INSTALL_PRIVATE_DATADIR_REL);
+            return 0;
+          }
+        else
+          return -1;
+    }
+#endif
+    strcpy (private_datadir, POCL_INSTALL_PRIVATE_DATADIR);
+    return 0;
+}
+
+/* returns path to a file from either the PoCL's source directory
+ * (if POCL_BUILDING=1), or PoCL's private datadir (if POCL_BUILDING=0)
+ * each arg (if not empty) should start with '/' but NOT end with it
+ */
+int pocl_get_srcdir_or_datadir (char* path,
+                                const char* srcdir_suffix,
+                                const char* datadir_suffix,
+                                const char* filename)
+{
+  path[0] = 0;
+#ifdef ENABLE_POCL_BUILDING
+  if (pocl_get_bool_option ("POCL_BUILDING", 0))
+    {
+      strcat(path, SRCDIR);
+      strcat(path, srcdir_suffix);
+      strcat(path, filename);
+    }
+  else
+#endif
+    {
+      if (pocl_get_private_datadir(path)) return -1;
+      strcat(path, datadir_suffix);
+      strcat(path, filename);
+    }
+
+  return 0;
+}
+
+
+void
+pocl_str_toupper(char *out, const char *in)
+{
+  int i;
+
+  for (i = 0; in[i] != '\0'; i++)
+    out[i] = toupper(in[i]);
+  out[i] = '\0';
+}
+
+void
+pocl_str_tolower(char *out, const char *in)
+{
+  int i;
+
+  for (i = 0; in[i] != '\0'; i++)
+    out[i] = tolower(in[i]);
+  out[i] = '\0';
 }
 
 int

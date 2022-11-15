@@ -13,10 +13,13 @@ Notable User Facing Changes
   * and other small fixes and improvements
 - SPIR-V support: much improved support for both CPU driver and CUDA
   * vectorized versions of kernel library functions now supported
-  * fixed some atomic related functions
-  * SPIR-V tests from OpenCL-CTS now pass (with sufficiently recent
+  * much improved support on ARM64 & x86-64 with recent LLVMs
+  * fixed some atomic builtin functions
+  * SPIR-V new subtests from OpenCL-CTS now pass (with sufficiently recent
     llvm-spirv translator)
+  * most of the CTS passes with offline-compile=spirv option
   * specialization constants are supported via clSetProgramSpecializationConstant
+- improved Valgrind/Helgrind support
 - All device names used to control the platform setup via
   POCL_DEVICES are now lower case (as documented in the user manual).
 - Switch from __sync_*() to __atomic_*() (compiler builtins).
@@ -29,6 +32,21 @@ Notable User Facing Changes
   then, but without the overhead from validating and computing the arguments.
 - Command buffer support is only reported for CPU devices for now. All drivers
   technically have the same capability but only CPU has been tested so far.
+- Built-in kernel support for CPU, CUDA and Accel-devices
+  * The .cl files in the driver directories are compiled to built-in kernels.
+  * Experimental CUDNN support for Cuda-driver through built-in kernels.
+- Major update to the custom device driver (Accel -> Now renamed to AlmaIF)
+  * Support more device types implementing AlmaIF
+    + Memory-mapped accelerator (for SoC FPGAs)
+    + Experimental XRT backend (for PCIe FPGAs)
+    + Instruction-set simulator (TTASim)
+    + Emulation device on host CPU
+- TTASim-driver will be deprecated as soon as all of its functionality
+  can be achieved with the almaif-driver. Most of it has already been
+  ported to almaif/TTASimDevice.cc.
+  * This move allows controlling TTASIM simulator and FPGA device
+    (and in future, RTL simulator) with the same runtime driver,
+    which reduces code duplication.
 
 Notable Bug Fixes
 -----------------

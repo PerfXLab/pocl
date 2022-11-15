@@ -1,3 +1,4 @@
+
 #!/usr/bin/python3
 #
 # A script to generate wrapping functions (SPIR-mangled with SPIR AS) that will wrap
@@ -10,14 +11,14 @@
 #
 # output is LLVM IR text format.
 #
-# Usage: python3 generate_spir_wrapper.py >spir_wrapper.ll
-# ... rename & place the file in the target-specific lib/kernel subdirectory.
+# Usage: python3 generate_spir_wrapper.py [-t <target>] [-r <register_size>] OUTPUT
+# ... place the file in the target-specific lib/kernel subdirectory.
 #
 # Notes for CPU SPIR wrapper:
 # 1) this expects the target kernel library to have a single AS (the default);
 #    it inserts addrspace casts.
-# 2) the X86-64 ABI complicates things by coercing arguments and byval passing,
-#    which means we need different wrappers for different CPU groups
+# 2) the CPU platform ABI complicates things by coercing arguments and using byval/sret,
+#    which means we need different wrappers for different CPUs and CPU groups
 #    (depending on largest register size available)
 # 3) target kernel library is expected to prefix functions. This is required
 #    even if the mangled names are the same, because the calling conv
@@ -36,19 +37,23 @@ import argparse
 
 parser = argparse.ArgumentParser(description='SPIR wrapper generator.')
 
-parser.add_argument('-d', '--driver',
-                    dest='driver',
-                    default="cpu", choices=["cpu", "cuda"],
-                    help='driver to generate wrapper for')
+parser.add_argument('-t', '--target',
+	dest='target',
+	default="cpu_x86", choices=["cpu_x86", "cpu_arm", "cuda"],
+	help='target to generate wrapper for')
 
 parser.add_argument('-r', '--register-size',
-                    dest='reg_size',
-                    default=128, type=int, choices=[128,256,512],
-                    help='largest register size (cpu driver only)')
+	dest='reg_size',
+	default=128, type=int, choices=[128,256,512],
+	help='largest register size (cpu target only)')
 
 parser.add_argument('output',
-                    type=argparse.FileType('w', encoding='utf-8'),
-                    help='output file')
+	type=argparse.FileType('w', encoding='utf-8'),
+	help='output file')
+
+parser.add_argument('-q', '--opaque-pointers',
+	dest='opaque_ptrs',
+	action='store_true')
 
 args = parser.parse_args()
 
@@ -57,20 +62,24 @@ POCL_LIB_PREFIX = "_cl_"
 
 # CUDA uses the same pointer AS-mangling as SPIR
 # set to False for CUDA wrapper, True for CPU wrapper
-MANGLE_OCL = True if args.driver == 'cpu' else False
+MANGLE_TARGET = args.target.startswith('cpu')
 
 # if True, creates AS casts of pointer arguments (all are cast to AS 0)
 # set to False for CUDA wrapper, True for CPU wrapper
-AS_CASTS_REQUIRED = True if args.driver == 'cpu' else False
+AS_CASTS_REQUIRED = args.target.startswith('cpu')
 
-# if set to True, does target specific (x86-64 CPU) hacks
-# like argument coercing (2xfloat -> double), byval passing
-# (for args that don't fit into registers)
-X86_CALLING_ABI = True if args.driver == 'cpu' else False
+# if set to True, does target specific hacks like
+# argument coercing (2xfloat -> double)
+# use of byval/sret for args that don't fit into registers
+X86_CALLING_ABI = (args.target == 'cpu_x86')
+ARM_CALLING_ABI = (args.target == 'cpu_arm')
+SPIR_CALLING_ABI = (args.target == 'cuda')
 
 # size of the largest CPU (SIMD) register. Values larger than this
-# will be passed with byval
-X86_ABI_REG_SIZE = args.reg_size
+# will be passed with byval/sret
+CPU_ABI_REG_SIZE = args.reg_size
+
+OPAQUE_POINTERS = args.opaque_ptrs
 
 sys.stdout = args.output
 
@@ -128,14 +137,22 @@ TRIPLE_ARG_I = [
 	"bitselect", "clamp", "mad_hi", "mad_sat"
 ]
 
-OLD_ATOMICS_INT_ONLY = [
-	"atomic_add",
+OLD_ATOMICS_INT32_ONLY = [
 	"atomic_sub",
 	"atomic_or",
 	"atomic_xor",
 	"atomic_and",
 	"atomic_min",
 	"atomic_max",
+]
+
+OLD_ATOMICS_INT64_ONLY = [
+	"atom_sub",
+	"atom_or",
+	"atom_xor",
+	"atom_and",
+	"atom_min",
+	"atom_max",
 ]
 
 
@@ -154,17 +171,11 @@ SVM_ATOMICS_FLAGS = [
 	"atomic_flag_clear"
 ]
 
-SVM_ATOMICS_ALL = {
-	"atomic_store",
-	"atomic_load",
-	"atomic_exchange",
-	"atomic_compare_exchange_strong",
-	"atomic_compare_exchange_weak",
-}
 
 SIG_TO_LLVM_TYPE_MAP = {
 	"f": "float",
 	"d": "double",
+	"Dh": "half",
 
 	"b": "i1",
 	"v": "void",
@@ -260,27 +271,52 @@ SIG_TO_LLVM_TYPE_MAP = {
 	'20ocl_image2d_array_wo': '%opencl.image2d_array_wo_t',
 	'21ocl_image1d_buffer_wo': '%opencl.image1d_buffer_wo_t',
 
-	'11ocl_sampler': '%opencl.sampler_t'
+	'11ocl_sampler': '%opencl.sampler_t',
+	'9ocl_event': '%opencl.event_t'
 }
 
-COERCE_VECTOR_MAP = {
-	"<2 x float>": "double",
+if X86_CALLING_ABI:
+	COERCE_VECTOR_MAP = {
+		"<2 x float>": "double",
 
-	"<2 x i8>": "i16",
-	"<2 x i16>": "i32",
-	"<2 x i32>": "double",
+		"<2 x i8>": "i16",
+		"<2 x i16>": "i32",
+		"<2 x i32>": "double",
 
-	"<3 x i8>": "i32",
-	"<3 x i16>": "double",
+		"<3 x i8>": "i32",
+		"<3 x i16>": "double",
 
-	"<4 x i8>": "i32",
-	"<4 x i16>": "double",
+		"<4 x i8>": "i32",
+		"<4 x i16>": "double",
 
-	"<8 x i8>": "double",
-}
+		"<8 x i8>": "double",
+	}
+elif ARM_CALLING_ABI:
+	COERCE_VECTOR_MAP = {
+		"<2 x half>": "i32",
+		"<3 x half>": "<2 x i32>",
 
-if X86_ABI_REG_SIZE == 128:
+		"<3 x float>": "<4 x i32>",
+
+		"<2 x i8>": "i32",
+		"<3 x i8>": "i32",
+		"<4 x i8>": "i32",
+
+		"<2 x i16>": "i32",
+		"<3 x i16>": "<2 x i32>",
+
+		"<3 x i32>": "<4 x i32>",
+	}
+else:
+	COERCE_VECTOR_MAP = {
+	}
+
+
+if CPU_ABI_REG_SIZE == 128:
 	BYVAL_VECTOR_MAP = {
+		"<3 x double>": "<3 x double>* byval(<3 x double>) align 32",
+		"<3 x i64>": "<3 x i64>* byval(<3 x i64>) align 32",
+
 		"<4 x i64>":"<4 x i64>* byval(<4 x i64>) align 32",
 		"<4 x double>": "<4 x double>* byval(<4 x double>) align 32",
 		"<8 x i32>":"<8 x i32>* byval(<8 x i32>) align 32",
@@ -296,8 +332,27 @@ if X86_ABI_REG_SIZE == 128:
 		"<16 x i64>":"<16 x i64>* byval(<16 x i64>) align 128",
 		"<16 x double>": "<16 x double>* byval(<16 x double>) align 128",
 	}
+	SRET_VECTOR_MAP = {
+		"<3 x double>": "<3 x double>* sret(<3 x double>) align 16",
+		"<3 x i64>": "<3 x i64>* sret(<3 x i64>) align 16",
 
-elif X86_ABI_REG_SIZE == 256:
+		"<4 x i64>":"<4 x i64>* sret(<4 x i64>) align 16",
+		"<4 x double>": "<4 x double>* sret(<4 x double>) align 16",
+		"<8 x i32>":"<8 x i32>* sret(<8 x i32>) align 16",
+		"<8 x float>": "<8 x float>* sret(<8 x float>) align 16",
+		"<16 x i16>": "<16 x i16>* sret(<8 x float>) align 16",
+
+		"<8 x i64>":"<8 x i64>* sret(<8 x i64>) align 16",
+		"<8 x double>": "<8 x double>* sret(<8 x double>) align 16",
+
+		"<16 x i32>": "<16 x i32>* sret(<16 x i32>) align 16",
+		"<16 x float>": "<16 x float>* sret(<16 x float>) align 16",
+
+		"<16 x i64>":"<16 x i64>* sret(<16 x i64>) align 16",
+		"<16 x double>": "<16 x double>* sret(<16 x double>) align 16",
+	}
+
+elif CPU_ABI_REG_SIZE == 256:
 	BYVAL_VECTOR_MAP = {
 		"<8 x i64>":"<8 x i64>* byval(<8 x i64>) align 64",
 		"<8 x double>": "<8 x double>* byval(<8 x double>) align 64",
@@ -308,17 +363,30 @@ elif X86_ABI_REG_SIZE == 256:
 		"<16 x i64>":"<16 x i64>* byval(<16 x i64>) align 128",
 		"<16 x double>": "<16 x double>* byval(<16 x double>) align 128",
 	}
+	SRET_VECTOR_MAP = {
+		"<8 x i64>":"<8 x i64>* sret(<8 x i64>) align 32",
+		"<8 x double>": "<8 x double>* sret(<8 x double>) align 32",
 
-elif X86_ABI_REG_SIZE == 512:
+		"<16 x i32>": "<16 x i32>* sret(<16 x i32>) align 32",
+		"<16 x float>": "<16 x float>* sret(<16 x float>) align 32",
+
+		"<16 x i64>":"<16 x i64>* sret(<16 x i64>) align 32",
+		"<16 x double>": "<16 x double>* sret(<16 x double>) align 32",
+	}
+
+elif CPU_ABI_REG_SIZE == 512:
 	BYVAL_VECTOR_MAP = {
 		"<16 x i64>":"<16 x i64>* byval(<16 x i64>) align 128",
 		"<16 x double>": "<16 x double>* byval(<16 x double>) align 128",
 	}
+	SRET_VECTOR_MAP = {
+		"<16 x i64>":"<16 x i64>* sret(<16 x i64>) align 64",
+		"<16 x double>": "<16 x double>* sret(<16 x double>) align 64",
+	}
 
 else:
-	print("Error, X86_ABI_REG_SIZE must be one of 128, 256, 512")
-	exit(2)
-
+	BYVAL_VECTOR_MAP = {}
+	SRET_VECTOR_MAP = {}
 
 SIG_TO_TYPE_NAME_MAP = {
 	"f": "float",
@@ -447,18 +515,40 @@ LLVM_SPIR_AS = {
 	"none": " "
 }
 
-# returns a LLVM argument type with addrspace
+# some coerced args require a shuffle b/c different size in bits
+def shuffle_coerced_arg(llvm_i, input_type, input_arg, all_instr):
+	if input_type.startswith("<3"):
+		four_vec = "<4" + input_type[2:]
+		all_instr.append("  %%%u = shufflevector %s, %s undef, <4 x i32> <i32 0, i32 1, i32 2, i32 undef>" % (llvm_i, input_arg, input_type))
+		shuffled_arg = four_vec + " %" + chr(48+llvm_i)
+		llvm_i += 1
+	elif ARM_CALLING_ABI and input_type == "<2 x i8>":
+		four_vec = "<4" + input_type[2:]
+		all_instr.append("  %%%u = shufflevector %s, %s undef, <4 x i32> <i32 0, i32 1, i32 undef, i32 undef>" % (llvm_i, input_arg, input_type))
+		shuffled_arg = four_vec + " %" + chr(48+llvm_i)
+		llvm_i += 1
+	else:
+		shuffled_arg = input_arg
+	return (shuffled_arg, llvm_i)
+
+# returns a LLVM type with addrspace
 # e.g. for argtype=="Pi" returns "i32 *"
 def llvm_arg_type(argtype, AS):
-	if argtype.count("ocl_image")>0 or argtype.count("ocl_sampler")>0 :
-		return SIG_TO_LLVM_TYPE_MAP[argtype] + AS + "*"
+	if argtype.count("ocl_image")>0 or argtype.count("ocl_sampler")>0 or argtype.count("ocl_event")>0:
+		if OPAQUE_POINTERS:
+			return "ptr " + AS
+		else:
+			return SIG_TO_LLVM_TYPE_MAP[argtype] + AS + "*"
 	if argtype[0] == 'P':
 		idx = 1
 		if argtype[1] == 'V' or argtype[1] == 'K':
 			idx = 2
 			if argtype[2] == 'A':
 				idx = 3
-		return SIG_TO_LLVM_TYPE_MAP[argtype[idx:]] + AS + "*"
+		if OPAQUE_POINTERS:
+			return "ptr " + AS
+		else:
+			return SIG_TO_LLVM_TYPE_MAP[argtype[idx:]] + AS + "*"
 	else:
 		return SIG_TO_LLVM_TYPE_MAP[argtype]
 
@@ -490,7 +580,7 @@ def pure_arg_type(argtype):
 	else:
 		return argtype
 
-# replace type keep qualifiers
+# replace type, but keep qualifiers
 def replace_arg_type(argtype, replacement):
 	if argtype[0] == 'P':
 		idx = 1
@@ -502,39 +592,56 @@ def replace_arg_type(argtype, replacement):
 	else:
 		return replacement
 
+# coerce vector type arguments (leave other types alone)
 def coerce_llvm_vector_type(type):
-	if not X86_CALLING_ABI:
+	if (not X86_CALLING_ABI) and (not ARM_CALLING_ABI):
 		return type
 	if type in COERCE_VECTOR_MAP:
 		return COERCE_VECTOR_MAP[type]
 	else:
 		return type
 
+# get arg type for types larger than cpu reg size
 def byval_llvm_vector_type(type):
-	if not X86_CALLING_ABI:
+	if (not X86_CALLING_ABI) and (not ARM_CALLING_ABI):
 		return type
-	if type in BYVAL_VECTOR_MAP:
+	if type not in BYVAL_VECTOR_MAP:
+		return type
+	if X86_CALLING_ABI:
 		return BYVAL_VECTOR_MAP[type]
-	else:
+	if ARM_CALLING_ABI:
+		return type+"*"
+
+# return type, only required for ARM cpu
+def sret_llvm_vector_type(type):
+	if not ARM_CALLING_ABI:
 		return type
+	if type not in SRET_VECTOR_MAP:
+		return type
+	return SRET_VECTOR_MAP[type]
 
-
+# generate wrapper function
 def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 	"""
 
 	:param name: function name
 	:param ret_type: LLVM type ("i32", "float" etc) of retval
 	:param ret_type_ext: retval's attributes ("signext" where required etc)
-	:param multiAS: True = generate for all three SPIR AddrSpaces
+	:param multiAS: True = generate for all multiple SPIR AddrSpaces
+	                (tuple) = explicit addrspaces for each arg, as a tuple
 	:param args: function arguments as mangled type names (i,j,m,f,d etc), not LLVM types
 	"""
 	ocl_func_name = POCL_LIB_PREFIX + name
 	spir_func_name = name
 
+	arg_addr_spaces = None
 	if not multiAS:
 		addr_spaces = ["none"]
+	elif type(multiAS) is tuple:
+		addr_spaces = ["none"]
+		arg_addr_spaces = multiAS
 	else:
-		if name.startswith("atomic"): # TODO
+		if name.startswith("atom"): # TODO
 			addr_spaces = ["global", "local"]  # , "generic"]
 		elif name.count("image")>0 or name.startswith("prefetch"):
 			addr_spaces = ["global"]
@@ -559,9 +666,35 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 		# arg without qualifiers, saved for mangling name compression
 		last_pure_arg = None
 
+		# ARM does not coerce return types, x86-64 does
+		if ARM_CALLING_ABI:
+			coerced_ret_type = ret_type
+		else:
+			coerced_ret_type = coerce_llvm_vector_type(ret_type)
+
+		# handle sret returvn value for ARM
+		# if the function uses even one sret type argument, it must also return with sret
+		sret_ret_type = sret_llvm_vector_type(ret_type)
+		retval_alloca_inst = None
+		retval_align = None
+		if ARM_CALLING_ABI and (ret_type != sret_ret_type):
+			# add alloca for retval
+			alignment = sret_ret_type.find("align")
+			if alignment > 0:
+				retval_align = sret_ret_type[alignment:]
+			else:
+				retval_align = "align 8"
+			all_instr.append("  %%%u = alloca %s, %s" % (llvm_i, ret_type, retval_align))
+			retval_alloca_inst = "%" + str(llvm_i)
+			callee_args.append(ret_type + "* " + retval_alloca_inst)
+			decl_args.append(sret_ret_type)
+			llvm_i += 1
+
 		####### process args
 		for cast in args:
 
+			if arg_addr_spaces:
+				AS = arg_addr_spaces[arg_i]
 			####### generate mangled arg type name for the mangled function name
 			# convert repeated vectors into compressed names, e.g.
 			#   Dv2_cDv2_c -> Dv2_cS_
@@ -575,14 +708,14 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 				actual_arg = replace_arg_type(actual_arg, "S4_")
 			last_pure_arg = pure_arg
 
-			# convert arg type to mangled type with AS
+			# convert arg type to SPIR mangled type with AS
 			# e.g. "Pi" -> "PU3AS3i"
 			spir_cast_arg = mang_suffix(actual_arg, MANGLING_AS_SPIR[AS])
 			spir_mangled_func_suffix.append(spir_cast_arg)
 
-			# mangle OpenCL differently if required by target
+			# mangle for target differently if required by target
 			# e.g. "Pi" -> "PU8CLglobali"
-			if MANGLE_OCL:
+			if MANGLE_TARGET:
 				ocl_cast_arg = mang_suffix(actual_arg, MANGLING_AS_OCL[AS])
 			else:
 				ocl_cast_arg = spir_cast_arg
@@ -594,7 +727,7 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 			# get coerced type
 			coerced_arg_type = coerce_llvm_vector_type(spir_arg_type)
 			# get byval type
-			byval_arg_type = byval_llvm_vector_type(spir_arg_type)
+			byval_sret_arg_type = byval_llvm_vector_type(spir_arg_type)
 			# get type with OpenCL AS
 			ocl_arg_type = spir_arg_type
 			if AS_CASTS_REQUIRED:
@@ -606,49 +739,43 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 			caller_args.append(noext_caller_arg)
 
 			####### generate arg types for callee (wrapped target function) and its declaration
-			# handle coerced args. Pointer args are not coerced so
+			# handle coerced args. Pointer args are not coerced or used with byval, so
 			# this shouldn't interact with addrspace casts.
 			if coerced_arg_type != spir_arg_type:
-				# handle 3-sized vectors
-				if spir_arg_type.startswith("<3"):
-					four_vec = "<4" + spir_arg_type[2:]
-					all_instr.append("  %%%u = shufflevector %s, %s undef, <4 x i32> <i32 0, i32 1, i32 2, i32 undef>" % (llvm_i, noext_caller_arg, spir_arg_type))
-					bitcasted_arg = four_vec + " %" + chr(48+llvm_i)
-					llvm_i += 1
-				else:
-					bitcasted_arg = noext_caller_arg
-
-				all_instr.append("  %%%u = bitcast %s to %s" % (llvm_i, bitcasted_arg, coerced_arg_type))
+				# some vectors require a shuffle
+				shuffled_arg, llvm_i = shuffle_coerced_arg(llvm_i, spir_arg_type, noext_caller_arg, all_instr)
+				all_instr.append("  %%%u = bitcast %s to %s" % (llvm_i, shuffled_arg, coerced_arg_type))
 				callee_args.append(coerced_arg_type + " %" + chr(48+llvm_i))
 				decl_args.append(coerced_arg_type)
 				llvm_i += 1
-			else:
+			elif spir_arg_type != ocl_arg_type:
 				# handle pointer args. insert addrspace casts if required by target
-				if spir_arg_type != ocl_arg_type:
-					all_instr.append("  %%%u = addrspacecast %s to %s" % (llvm_i, noext_caller_arg, ocl_arg_type))
-					callee_args.append(ocl_arg_type + " %" + chr(48+llvm_i))
-					decl_args.append(ocl_arg_type)
-					llvm_i += 1
+				all_instr.append("  %%%u = addrspacecast %s to %s" % (llvm_i, noext_caller_arg, ocl_arg_type))
+				callee_args.append(ocl_arg_type + " %" + chr(48+llvm_i))
+				decl_args.append(ocl_arg_type)
+				llvm_i += 1
+			elif byval_sret_arg_type != spir_arg_type:
+				# handle byval args. insert alloca & store as necessary
+				alignment = byval_sret_arg_type.find("align")
+				if alignment > 0:
+					align = byval_sret_arg_type[alignment:]
 				else:
-					# handle byval args. insert store / loads as necessary
-					if byval_arg_type != spir_arg_type:
-						# add alloca & store
-						alignment = byval_arg_type.find("align")
-						if alignment > 0:
-							align = byval_arg_type[alignment:]
-						else:
-							align = "align 8"
-						all_instr.append("  %%%u = alloca %s, %s" % (llvm_i, spir_arg_type, align))
-						alloca_inst = "%" + chr(48+llvm_i)
-						all_instr.append("  store %s, %s* %s, %s" % (noext_caller_arg, spir_arg_type, alloca_inst, align))
-						callee_args.append(ocl_arg_type + "* " + alloca_inst)
-						decl_args.append(byval_arg_type)
-						llvm_i += 1
-					else:
-						# nothing to do, just pass plain arg
-						callee_args.append(ocl_arg_type + " %" + chr(97+arg_i))
-						decl_args.append(ocl_arg_type)
+					align = "align 8"
+				all_instr.append("  %%%u = alloca %s, %s" % (llvm_i, spir_arg_type, align))
+				alloca_inst = "%" + chr(48+llvm_i)
+				if OPAQUE_POINTERS:
+					all_instr.append("  store %s, ptr %s, %s" % (noext_caller_arg, alloca_inst, align))
+				else:
+					all_instr.append("  store %s, %s* %s, %s" % (noext_caller_arg, spir_arg_type, alloca_inst, align))
+				callee_args.append(ocl_arg_type + "* " + alloca_inst)
+				decl_args.append(byval_sret_arg_type)
+				llvm_i += 1
+			else:
+				# nothing to do, just pass plain arg
+				callee_args.append(ocl_arg_type + " %" + chr(97+arg_i))
+				decl_args.append(ocl_arg_type)
 			arg_i += 1
+
 
 		######## generate final mangled function names
 		spir_mangled_func_suffix = "".join(spir_mangled_func_suffix)
@@ -661,9 +788,12 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 		ocl_mangled_name = "@_Z%u%s%s" % (len(ocl_func_name), ocl_func_name, ocl_mangled_func_suffix)
 
 		####### generate function body
-		coerced_ret_type = coerce_llvm_vector_type(ret_type)
 
-		print("declare %s %s(%s) local_unnamed_addr #0" % (coerced_ret_type, ocl_mangled_name, decl_args))
+		if retval_alloca_inst:
+			decl_ret_type = 'void'
+		else:
+			decl_ret_type = coerced_ret_type
+		print("declare %s %s(%s) local_unnamed_addr #0" % (decl_ret_type, ocl_mangled_name, decl_args))
 		print("")
 		print("define spir_func %s %s(%s) local_unnamed_addr #0 {" % (ret_type_ext + ret_type, spir_mangled_name, caller_args))
 
@@ -672,19 +802,28 @@ def generate_function(name, ret_type, ret_type_ext, multiAS, *args):
 				print(cast)
 
 		if ret_type == 'void':
-			print("  tail call %s %s(%s)" % (ret_type, ocl_mangled_name, callee_args))
+			print("  tail call void %s(%s)" % (ocl_mangled_name, callee_args))
 			print("  ret void" )
 		else:
 			if ret_type != coerced_ret_type:
-				print("  %%coerced_call = tail call %s %s(%s)" % (coerced_ret_type, ocl_mangled_name, callee_args))
+				print("  %%coerced_ret = call %s %s(%s)" % (coerced_ret_type, ocl_mangled_name, callee_args))
 				if ret_type.startswith("<3"):
 					four_vec = "<4" + ret_type[2:]
-					print("  %%bc_ret = bitcast %s %%coerced_call to %s" % (coerced_ret_type, four_vec))
+					print("  %%bc_ret = bitcast %s %%coerced_ret to %s" % (coerced_ret_type, four_vec))
 					print("  %%final_ret = shufflevector %s %%bc_ret, %s undef, <3 x i32> <i32 0, i32 1, i32 2>" % (four_vec, four_vec))
 				else:
-					print("  %%final_ret = bitcast %s %%coerced_call to %s" % (coerced_ret_type, ret_type))
+					print("  %%final_ret = bitcast %s %%coerced_ret to %s" % (coerced_ret_type, ret_type))
 
 				print("  ret %s %%final_ret" % ret_type)
+			elif ARM_CALLING_ABI and (ret_type != sret_ret_type):
+				print("  call void %s(%s)" % (ocl_mangled_name, callee_args))
+				# add load from alloca
+				if OPAQUE_POINTERS:
+					print("  %%%u = load %s, ptr %s, %s" % (llvm_i, ret_type, retval_alloca_inst, retval_align))
+				else:
+					print("  %%%u = load %s, %s* %s, %s" % (llvm_i, ret_type, ret_type, retval_alloca_inst, retval_align))
+				print("  ret %s %%%u" % (ret_type, llvm_i))
+
 			else:
 				print("  %%call = tail call %s %s(%s)" % (ret_type, ocl_mangled_name, callee_args))
 				print("  ret %s %%call" % ret_type)
@@ -787,6 +926,20 @@ MANG_TYPES_64 = {
 	'u': "m"
 }
 
+INVERT_SIGN = {
+	"c": "h",
+	"h": "c",
+
+	"s": "t",
+	"t": "s",
+
+	"i": "j",
+	"j": "i",
+
+	"l": "m",
+	"m": "l",
+}
+
 # math funcs, vectorized
 for llvm_type in ["float", "double"]:
 	for vector_size in [1,2,3,4,8,16]:
@@ -805,6 +958,10 @@ for llvm_type in ["float", "double"]:
 		arg_Pi = 'Pi'
 		ret_type = llvm_type
 		rel_rettype = 'i32'
+		i32_rettype = 'i32'
+		novec_type = arg_f
+		novec_type_i = arg_i
+		arg_inv = INVERT_SIGN[arg_li]
 
 		if vector_size > 1:
 			s = str(vector_size)
@@ -813,8 +970,10 @@ for llvm_type in ["float", "double"]:
 			arg_Pf = "PDv" + s + "_"+arg_f
 			arg_f = "Dv" + s + "_"+arg_f
 			arg_li = "Dv" + s + "_"+arg_li
+			arg_inv = "Dv" + s + "_"+arg_inv
 			arg_lu = "Dv" + s + "_"+arg_lu
 			ret_type = "<" + s + " x " + llvm_type + ">"
+			i32_rettype = "<" + s + " x i32>"
 			if llvm_type == "float":
 				rel_rettype = "<" + s + " x i32>"
 			else:
@@ -829,8 +988,19 @@ for llvm_type in ["float", "double"]:
 		for f in TRIPLE_ARG:
 			generate_function(f, ret_type, '', False, arg_f, arg_f, arg_f)
 
+		if vector_size > 1:
+			generate_function("clamp", ret_type, '', False, arg_f, novec_type, novec_type)
+			generate_function("min", ret_type, '', False, arg_f, novec_type)
+			generate_function("max", ret_type, '', False, arg_f, novec_type)
+			generate_function("fmin", ret_type, '', False, arg_f, novec_type)
+			generate_function("fmax", ret_type, '', False, arg_f, novec_type)
+			generate_function("mix", ret_type, '', False, arg_f, arg_f, novec_type)
+			generate_function("ldexp", ret_type, '', False, arg_f, novec_type_i)
+			generate_function("smoothstep", ret_type, '', False, novec_type, novec_type, arg_f)
+			generate_function("step", ret_type, '', False, novec_type, arg_f)
+
 		# math funcs with other / special signatures
-		generate_function("ilogb", "i32", '', False, arg_f)
+		generate_function("ilogb", i32_rettype, '', False, arg_f)
 
 		generate_function("ldexp", ret_type, '', False, arg_f, arg_i)
 		generate_function("pown", ret_type, '', False, arg_f, arg_i)
@@ -860,6 +1030,9 @@ for llvm_type in ["float", "double"]:
 		generate_function("isordered", rel_rettype, '', False, arg_f, arg_f)
 		generate_function("isunordered", rel_rettype, '', False, arg_f, arg_f)
 
+		# must generate with last arg un/signed types too
+		generate_function("select", ret_type, '', False, arg_f, arg_f, arg_li)
+		generate_function("select", ret_type, '', False, arg_f, arg_f, arg_inv)
 
 # geometric functions
 generate_function("cross", "<4 x float>", '', False, "Dv4_f", "Dv4_f")
@@ -879,14 +1052,14 @@ for W in ["1", "2","3","4"]:
 	generate_function("distance", "double", '', False, arg_d, arg_d)
 	generate_function("length", "float", '', False, arg_f)
 	generate_function("length", "double", '', False, arg_d)
-	generate_function("normalize", "float", '', False, arg_f)
-	generate_function("normalize", "double", '', False, arg_d)
+	generate_function("normalize", SIG_TO_LLVM_TYPE_MAP[arg_f], '', False, arg_f)
+	generate_function("normalize", SIG_TO_LLVM_TYPE_MAP[arg_d], '', False, arg_d)
 	generate_function("fast_distance", "float", '', False, arg_f, arg_f)
 	generate_function("fast_distance", "double", '', False, arg_d, arg_d)
 	generate_function("fast_length", "float", '', False, arg_f)
 	generate_function("fast_length", "double", '', False, arg_d)
-	generate_function("fast_normalize", "float", '', False, arg_f)
-	generate_function("fast_normalize", "double", '', False, arg_d)
+	generate_function("fast_normalize", SIG_TO_LLVM_TYPE_MAP[arg_f], '', False, arg_f)
+	generate_function("fast_normalize", SIG_TO_LLVM_TYPE_MAP[arg_d], '', False, arg_d)
 
 # upsample has special arguments
 UPSAMPLE_1ST_ARG = {
@@ -918,34 +1091,59 @@ for mang_type in ['s', 't', 'i', 'j', 'l', 'm']:
 			arg_2nd = "Dv" + s + "_" + arg_2nd
 		generate_function("upsample", SIG_TO_LLVM_TYPE_MAP[mang_type], '', False, arg_1st, arg_2nd)
 
-# vload / vstore
+# vload / vstore / prefetch / async
 for arg_type in ['c', 'h', 's', 't', 'i', 'j', 'l', 'm', 'f', 'd']:
-	for vector_size in [2,3,4,8,16]:
+	for vector_size in [1,2,3,4,8,16]:
 		arg = arg_type
 		PConstArg = 'PK' + arg_type
 		PArg = 'P' + arg_type
 		if vector_size > 1:
 			s = str(vector_size)
-#			PConstArg = "PDv" + s + "_" + arg_type
 			arg = "Dv" + s + "_" + arg_type
 
-		generate_function("vload"+str(vector_size), SIG_TO_LLVM_TYPE_MAP[arg], '', True, 'm', PConstArg)
-		generate_function("vstore"+str(vector_size), SIG_TO_LLVM_TYPE_MAP['v'], '', True, arg, 'm', PArg)
-		generate_function("prefetch", SIG_TO_LLVM_TYPE_MAP['v'], '', True, arg, PConstArg, 'm')
+		if vector_size > 1:
+			generate_function("vload"+str(vector_size), SIG_TO_LLVM_TYPE_MAP[arg], '', True, 'm', PConstArg)
+			generate_function("vstore"+str(vector_size), SIG_TO_LLVM_TYPE_MAP['v'], '', True, arg, 'm', PArg)
 
-INVERT_SIGN = {
-	"c": "h",
-	"h": "c",
+		if vector_size > 1:
+			PConstArg = 'PK' + arg
+			PArg = 'P' + arg
 
-	"s": "t",
-	"t": "s",
+		generate_function("prefetch", SIG_TO_LLVM_TYPE_MAP['v'], '', True, PConstArg, 'm')
 
-	"i": "j",
-	"j": "i",
+		generate_function("async_work_group_copy", SIG_TO_LLVM_TYPE_MAP['9ocl_event'], '',
+											("global", "local", "none", "none", "none"),
+											PArg, PConstArg, 'm', '9ocl_event')
+		generate_function("async_work_group_copy", SIG_TO_LLVM_TYPE_MAP['9ocl_event'], '',
+											("local", "global", "none", "none", "none"),
+											PArg, PConstArg, 'm', '9ocl_event')
 
-	"l": "m",
-	"m": "l",
-}
+		generate_function("async_work_group_strided_copy", SIG_TO_LLVM_TYPE_MAP['9ocl_event'], '',
+											("global", "local", "none", "none", "none"),
+											PArg, PConstArg, 'm', 'm', '9ocl_event')
+		generate_function("async_work_group_strided_copy", SIG_TO_LLVM_TYPE_MAP['9ocl_event'], '',
+											("local", "global", "none", "none", "none"),
+											PArg, PConstArg, 'm', 'm', '9ocl_event')
+
+
+# vload_half / vstore_half
+for ret_type in ['f','d']:
+	for vector_size in [1,2,3,4,8,16]:
+		ret = ret_type
+		arg = 'h'
+		PConstArg = 'PKDh'
+		PArg = 'PDh'
+		suffix = 'half'
+		if vector_size > 1:
+			s = str(vector_size)
+			suffix = 'half' + s
+			ret = "Dv" + s + "_" + ret
+		if ret_type == 'f':
+			generate_function("vload_"+suffix, SIG_TO_LLVM_TYPE_MAP[ret], '', True, 'm', PConstArg)
+			generate_function("vloada_"+suffix, SIG_TO_LLVM_TYPE_MAP[ret], '', True, 'm', PConstArg)
+		for rounding in ['', '_rte', '_rtn', '_rtp', '_rtz']:
+			generate_function("vstore_"+suffix+rounding, SIG_TO_LLVM_TYPE_MAP['v'], '', True, ret, 'm', PArg)
+			generate_function("vstorea_"+suffix+rounding, SIG_TO_LLVM_TYPE_MAP['v'], '', True, ret, 'm', PArg)
 
 # Integer
 for arg_type in ['c', 'h', 's', 't', 'i', 'j', 'l', 'm']:
@@ -954,28 +1152,43 @@ for arg_type in ['c', 'h', 's', 't', 'i', 'j', 'l', 'm']:
 		arg_i = arg_type
 		arg_inv = INVERT_SIGN[arg_type]
 		signext = LLVM_TYPE_EXT_MAP[arg_type]
+		novec_type = arg_i
 		if vector_size > 1:
 			s = str(vector_size)
 			arg_i = "Dv" + s + "_" + arg_i
 			arg_inv = "Dv" + s + "_" + arg_inv
 			signext = ''
+		ret_type = SIG_TO_LLVM_TYPE_MAP[arg_i]
 
 		for f in SINGLE_ARG_I:
-			generate_function(f, SIG_TO_LLVM_TYPE_MAP[arg_i], signext, False, arg_i)
+			generate_function(f, ret_type, signext, False, arg_i)
 		for f in DUAL_ARG_I:
-			generate_function(f, SIG_TO_LLVM_TYPE_MAP[arg_i], signext, False, arg_i, arg_i)
+			generate_function(f, ret_type, signext, False, arg_i, arg_i)
 		for f in TRIPLE_ARG_I:
-			generate_function(f, SIG_TO_LLVM_TYPE_MAP[arg_i], signext, False, arg_i, arg_i, arg_i)
+			generate_function(f, ret_type, signext, False, arg_i, arg_i, arg_i)
 		# TODO unsigned ??
 		generate_function("any", "i32", '', False, arg_i)
 		generate_function("all", "i32", '', False, arg_i)
 		# must generate with last arg un/signed types too
-		generate_function("select", SIG_TO_LLVM_TYPE_MAP[arg_i], '', False, arg_i, arg_i, arg_i)
-		generate_function("select", SIG_TO_LLVM_TYPE_MAP[arg_i], '', False, arg_i, arg_i, arg_inv)
+		generate_function("select", ret_type, '', False, arg_i, arg_i, arg_i)
+		generate_function("select", ret_type, '', False, arg_i, arg_i, arg_inv)
+		if vector_size > 1:
+			generate_function("clamp", ret_type, '', False, arg_i, novec_type, novec_type)
+			generate_function("min", ret_type, '', False, arg_i, novec_type)
+			generate_function("max", ret_type, '', False, arg_i, novec_type)
+			generate_function("mix", ret_type, '', False, arg_i, arg_i, novec_type)
+		if arg_type in ['i', 'j']:
+			# "mul24", "mad24" only take an i32
+			generate_function("mul24", ret_type, signext, False, arg_i, arg_i)
+			generate_function("mad24", ret_type, signext, False, arg_i, arg_i, arg_i)
 
 # shuffle / shuffle2
-for arg_type in ['c', 'h', 's', 't', 'i', 'j', 'l', 'm']:
-	if arg_type in ['c', 's', 'i', 'l']:
+for arg_type in ['c', 'h', 's', 't', 'i', 'j', 'l', 'm', 'f', 'd']:
+	if arg_type == 'd':
+		uarg_type = 'm'
+	elif arg_type == 'f':
+		uarg_type = 'j'
+	elif arg_type in ['c', 's', 'i', 'l']:
 		uarg_type = INVERT_SIGN[arg_type]
 	else:
 		uarg_type = arg_type
@@ -1050,57 +1263,76 @@ for img_type in ['image1d', 'image2d', 'image3d', 'image1d_array', 'image2d_arra
 		generate_function('get_image_width', 'i32', '', True, img_type_llvm)
 		if img_type.startswith('image2') or img_type.startswith('image3'):
 			generate_function('get_image_height', 'i32', '', True, img_type_llvm)
-		if img_type in ['image2d_t','image2d_array_t','image2d_depth_t', 'image2d_array_depth_t']:
+		if img_type in ['image2d','image2d_array','image2d_depth', 'image2d_array_depth']:
 			generate_function('get_image_dim', '<2 x i32>', '', True, img_type_llvm)
 		if img_type == 'image3d':
 			generate_function('get_image_depth', 'i32', '', True, img_type_llvm)
 			generate_function('get_image_dim', '<4 x i32>', '', True, img_type_llvm)
-		if img_type in ['image2d_array_t', 'image2d_array_depth_t', 'image1d_array_t']:
+		if img_type in ['image2d_array', 'image2d_array_depth', 'image1d_array']:
 			generate_function('get_image_array_size', 'i64', '', True, img_type_llvm)
 
 
 # Atomics
 for mang_type in ['i', 'j', "l", "m"]:
+	ret_type = SIG_TO_LLVM_TYPE_MAP[mang_type]
+	ret_ext = LLVM_TYPE_EXT_MAP[mang_type]
 	for f in SVM_ATOMICS_INT_ONLY:
-		generate_function(f, SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PVA'+mang_type, mang_type)
-		generate_function(f+"_explicit", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PVA'+mang_type, mang_type, "12memory_order")
-		generate_function(f+"_explicit", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PVA'+mang_type, mang_type, "12memory_order", "12memory_scope")
+		generate_function(f, ret_type, ret_ext, True, 'PVA'+mang_type, mang_type)
+		generate_function(f+"_explicit", ret_type, ret_ext, True, 'PVA'+mang_type, mang_type, "12memory_order")
+		generate_function(f+"_explicit", ret_type, ret_ext, True, 'PVA'+mang_type, mang_type, "12memory_order", "12memory_scope")
+	if mang_type in ['i', 'j']:
+		for f in OLD_ATOMICS_INT32_ONLY:
+			generate_function(f, ret_type, ret_ext, True, 'PV'+mang_type, mang_type)
+		# dec, inc take only 1 argument
+		generate_function("atomic_inc", ret_type, ret_ext, True, 'PV'+mang_type)
+		generate_function("atomic_dec", ret_type, ret_ext, True, 'PV'+mang_type)
+	if mang_type in ['l', 'm']:
+		for f in OLD_ATOMICS_INT64_ONLY:
+			generate_function(f, ret_type, ret_ext, True, 'PV'+mang_type, mang_type)
+		# dec, inc take only 1 argument
+		generate_function("atom_inc", ret_type, ret_ext, True, 'PV'+mang_type)
+		generate_function("atom_dec", ret_type, ret_ext, True, 'PV'+mang_type)
 
-for mang_type in ['i', 'j', "l", "m"]:
-	for f in OLD_ATOMICS_INT_ONLY:
-		generate_function(f, SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
-	# dec, inc take only 1 argument
-	generate_function("atomic_inc", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type)
-	generate_function("atomic_dec", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type)
-
-for mang_type in ['i', 'j', "l", "m", "f", "d"]:
+# workaround for code generated by LLVM-SPIRV (with target-env == CL1.2,
+# emulates atomic_load/atomic_store with atomic_xchg/atomic_add)
+for mang_type in ['i', 'j', "f", ]:
+	generate_function("atomic_add", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
 	generate_function("atomic_xchg", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
 	generate_function("atomic_cmpxchg", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type, mang_type)
+
+for mang_type in ["l", "m", "d"]:
+	generate_function("atom_add", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
+	generate_function("atom_xchg", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
+	generate_function("atom_cmpxchg", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type, mang_type)
+	# part of the workaround for LLVM-SPIRV
+	generate_function("atomic_add", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
+	generate_function("atomic_xchg", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, 'PV'+mang_type, mang_type)
+
+
+def gen_three_variants(f, ret_type, ret_ext, AS, args, orders):
+	generate_function(f, ret_type, ret_ext, AS, *args)
+	generate_function(f+"_explicit", ret_type, ret_ext, AS, *args, *orders)
+	generate_function(f+"_explicit", ret_type, ret_ext, AS, *args, *orders, "12memory_scope")
 
 
 for mang_type in ['i', 'j', "l", "m", "f", "d"]:
 	generate_function("atomic_init", SIG_TO_LLVM_TYPE_MAP['v'], LLVM_TYPE_EXT_MAP['v'], True, 'PVA'+mang_type, mang_type)
-	for f in SVM_ATOMICS_ALL:
-		args = None
-		cmpxchg = False
-		orders = ["12memory_order"]
-		if f == "atomic_store":
-			args = ['PVA'+mang_type, mang_type]
-			ret = "v"
-		if f == "atomic_load":
-			args = ['PVA'+mang_type]
-			ret = mang_type
-		if f == "atomic_exchange":
-			args = ['PVA'+mang_type, mang_type]
-			ret = mang_type
-		if f == "atomic_compare_exchange_strong" or f == "atomic_compare_exchange_weak":
-			args = ['PVA'+mang_type, 'P'+mang_type, mang_type]
-			ret = "b"
-			orders = ["12memory_order", "12memory_order"]
+	ret_type = SIG_TO_LLVM_TYPE_MAP[mang_type]
+	ret_ext = LLVM_TYPE_EXT_MAP[mang_type]
+	gen_three_variants("atomic_store", 'void', '', True, ['PVA'+mang_type, mang_type], ["12memory_order"])
+	gen_three_variants("atomic_load", ret_type, ret_ext, True, ['PVA'+mang_type], ["12memory_order"])
+	gen_three_variants("atomic_exchange", ret_type, ret_ext, True, ['PVA'+mang_type, mang_type], ["12memory_order"])
 
-		generate_function(f, SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, *args)
-		generate_function(f+"_explicit", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, *args, *orders)
-		generate_function(f+"_explicit", SIG_TO_LLVM_TYPE_MAP[mang_type], LLVM_TYPE_EXT_MAP[mang_type], True, *args, *orders, "12memory_scope")
+	for AS in ["global", "local"]:
+		gen_three_variants("atomic_compare_exchange_strong", SIG_TO_LLVM_TYPE_MAP['b'], '',
+											(AS, "private", "none", "none", "none", "none"),
+											['PVA'+mang_type, 'P'+mang_type, mang_type],
+											["12memory_order", "12memory_order"])
+		gen_three_variants("atomic_compare_exchange_weak", SIG_TO_LLVM_TYPE_MAP['b'], '',
+											(AS, "private", "none", "none", "none", "none"),
+											['PVA'+mang_type, 'P'+mang_type, mang_type],
+											["12memory_order", "12memory_order"])
+
 
 for f in SVM_ATOMICS_FLAGS:
 	generate_function(f, SIG_TO_LLVM_TYPE_MAP['b'], LLVM_TYPE_EXT_MAP['b'], True, 'PVAi')
@@ -1109,15 +1341,10 @@ for f in SVM_ATOMICS_FLAGS:
 
 
 
-# "mul24", "mad24" only take an i32
-generate_function("mul24", SIG_TO_LLVM_TYPE_MAP['i'], LLVM_TYPE_EXT_MAP['i'], False, 'i', 'i')
-generate_function("mul24", SIG_TO_LLVM_TYPE_MAP['j'], LLVM_TYPE_EXT_MAP['j'], False, 'j', 'j')
-generate_function("mad24", SIG_TO_LLVM_TYPE_MAP['i'], LLVM_TYPE_EXT_MAP['i'], False, 'i', 'i', 'i')
-generate_function("mad24", SIG_TO_LLVM_TYPE_MAP['j'], LLVM_TYPE_EXT_MAP['j'], False, 'j', 'j', 'j')
 
 print("""
 
-attributes #0 = { nounwind "correctly-rounded-divide-sqrt-fp-math"="false" "denorms-are-zero"="false" "disable-tail-calls"="false" "less-precise-fpmad"="false" "no-frame-pointer-elim"="true" "no-frame-pointer-elim-non-leaf" "no-infs-fp-math"="false" "no-nans-fp-math"="false" "no-signed-zeros-fp-math"="false" "no-trapping-math"="false" "stack-protector-buffer-size"="8" "unsafe-fp-math"="false" "use-soft-float"="false" }
+attributes #0 = { alwaysinline nounwind "correctly-rounded-divide-sqrt-fp-math"="false" "denorms-are-zero"="false" "disable-tail-calls"="false" "less-precise-fpmad"="false" "no-frame-pointer-elim"="true" "no-frame-pointer-elim-non-leaf" "no-infs-fp-math"="false" "no-nans-fp-math"="false" "no-signed-zeros-fp-math"="false" "no-trapping-math"="false" "stack-protector-buffer-size"="8" "unsafe-fp-math"="false" "use-soft-float"="false" }
 
 !opencl.ocl.version = !{!0}
 !opencl.spir.version = !{!0}
@@ -1125,7 +1352,7 @@ attributes #0 = { nounwind "correctly-rounded-divide-sqrt-fp-math"="false" "deno
 !llvm.module.flags = !{!2, !3}
 
 !0 = !{i32 1, i32 2}
-!1 = !{!"clang version 6.0.0"}
+!1 = !{!"clang version 12.0.0"}
 !2 = !{i32 1, !"wchar_size", i32 4}
 !3 = !{i32 7, !"PIC Level", i32 2}
 

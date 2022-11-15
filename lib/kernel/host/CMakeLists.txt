@@ -33,7 +33,6 @@ as_type.cl
 async_work_group_copy.cl
 async_work_group_strided_copy.cl
 atomics.cl
-addrspace_operators.ll
 barrier.ll
 bitselect.cl
 clamp.cl
@@ -241,6 +240,17 @@ sleef-pocl/tgamma.cl
 sleef-pocl/trunc.cl
 )
 
+include("bitcode_rules")
+
+foreach(FILE addrspace_operators.ll)
+  if(LLVM_OPAQUE_POINTERS)
+    generate_opaque_ptr_ll("${FILE}" "opaque" OPAQ_PTR_FILE)
+    list(APPEND SOURCES_WITH_SLEEF "${OPAQ_PTR_FILE}")
+  else()
+    list(APPEND SOURCES_WITH_SLEEF "${FILE}")
+  endif()
+endforeach()
+
 if(ENABLE_POCL_FLOAT_CONVERSION)
   list(APPEND SOURCES_WITH_SLEEF "errol/errol.c")
 endif()
@@ -271,7 +281,6 @@ endforeach()
 
 #=============================================================================
 
-include("bitcode_rules")
 
 if(ENABLE_SLEEF)
   set(KERNEL_SOURCES ${SOURCES_WITH_SLEEF})
@@ -413,15 +422,16 @@ function(compile_sleef VARIANT SLEEF_CONFIG SLEEF_CONFIG_NEW SLEEF_BC)
   if(HOST_DEVICE_ADDRESS_BITS EQUAL 32)
     set(SPIR_WRAPPER_FILE "host/spir_wrapper32.ll")
   else()
-    if((NOT X86) OR (LLVM_VERSION_MAJOR LESS 10))
-      # for older LLVMs and non-X86 CPUs, use a generic 64bit wrapper
-      # this doesn't support vectors and misses some
-      # functions, but otherwise should mostly work
-      set(SPIR_WRAPPER_FILE "host/spir_wrapper64.ll")
-    else()
-      # for X86-64, SPIR wrapper is decided later
+    if((X86 AND LLVM_VERSION_MAJOR GREATER 9) OR
+       (ARM AND LLVM_VERSION_MAJOR GREATER 11))
+      # for X86-64 & ARM, use the generated SPIR wrapper,
       # based on CPU's largest supported vector size
       set(SPIR_WRAPPER_FILE "")
+    else()
+      # for older LLVMs or other CPUs, use a generic
+      # 64bit wrapper, this doesn't support vectors and misses
+      # some functions, but otherwise should mostly work
+      set(SPIR_WRAPPER_FILE "host/spir_wrapper64.ll")
     endif()
   endif()
 
@@ -443,8 +453,13 @@ function(compile_sleef VARIANT SLEEF_CONFIG SLEEF_CONFIG_NEW SLEEF_BC)
       set(STR "#define SLEEF_VEC_${VECSIZE}_AVAILABLE\n")
       file(APPEND "${SLEEF_CONFIG_NEW}" "${STR}")
 
-      if(NOT SPIR_WRAPPER_FILE)
-        generate_x86_64_spir_wrapper(${VARIANT} ${VECSIZE} SPIR_WRAPPER_FILE)
+      if(ENABLE_SPIR AND NOT SPIR_WRAPPER_FILE)
+        if (ARM)
+          generate_cpu_spir_wrapper(cpu_arm ${VARIANT} ${VECSIZE} SPIR_WRAPPER_FILE)
+        endif()
+        if(X86)
+          generate_cpu_spir_wrapper(cpu_x86 ${VARIANT} ${VECSIZE} SPIR_WRAPPER_FILE)
+        endif()
         set(HAVE_WORKING_IMAGES_WITH_SPIR ON CACHE BOOL "image functions work with SPIR" FORCE)
       endif()
     else()
@@ -463,7 +478,9 @@ function(compile_sleef VARIANT SLEEF_CONFIG SLEEF_CONFIG_NEW SLEEF_BC)
 
   endforeach()
 
-  compile_ll_to_bc("${SPIR_WRAPPER_FILE}" "${VARIANT}" BC_FILE_LIST)
+  if(ENABLE_SPIR)
+    compile_ll_to_bc("${SPIR_WRAPPER_FILE}" "${VARIANT}" BC_FILE_LIST)
+  endif()
 
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${VARIANT}")
   set(SLEEF_BC "${CMAKE_CURRENT_BINARY_DIR}/${VARIANT}/sleef.bc")

@@ -35,8 +35,8 @@
 #include "builtin_kernels.hh"
 #include "common_driver.h"
 #include "pocl_cache.h"
-#include "pocl_hash.h"
-#include "pocl_runtime_config.h"
+#include "builtin_kernels.hh"
+#include "common_driver.h"
 
 #ifndef _MSC_VER
 #  include <unistd.h>
@@ -204,8 +204,9 @@ TCEDevice::initMemoryManagement(const TTAMachine::Machine& mach) {
   parent->global_mem_size = global_size;
   parent->max_mem_alloc_size = global_size;
 
-  pocl_init_mem_region
-    (&local_mem, (memory_address_t)local_as->start(), parent->local_mem_size);
+  pocl_init_mem_region(&local_mem,
+                       (memory_address_t)local_as->end() - local_size,
+                       parent->local_mem_size);
   pocl_init_mem_region
     (&global_mem, (memory_address_t)global_as->start() + TTA_UNALLOCATED_GLOBAL_SPACE + sizeof(__kernel_exec_cmd),
      parent->global_mem_size);
@@ -256,8 +257,6 @@ TCEString TCEDevice::tceccCommandLine(_cl_command_run *run_cmd,
   if (parent->endian_little) {
     extraFlags += " --little-endian";
   }
-
-  //  extraFlags += " --swfp";
 
   std::string kernelMdSymbolName = "_";
   kernelMdSymbolName += run_cmd->kernel->name;
@@ -472,7 +471,7 @@ void pocl_tce_compile_kernel(_cl_command_node *Command, cl_kernel Kernel,
     POCL_MSG_PRINT_GENERAL("TCE: pocl_llvm_generate_workgroup_function()"
                            " failed for kernel %s\n",
                            Kernel->name);
-    POCL_ABORT("TCE compilation error\n");
+    POCL_ABORT ("TCE compilation error\n");
   }
 
   // 12 == strlen (POCL_PARALLEL_BC_FILENAME)
@@ -519,30 +518,7 @@ void pocl_tce_compile_kernel(_cl_command_node *Command, cl_kernel Kernel,
   POCL_UNLOCK(Dev->tce_compile_lock);
 }
 
-int pocl_tce_build_builtin(cl_program program, cl_uint device_i) {
-  int err;
 
-  POCL_MSG_PRINT_TCE("preparing OPENCL builtin kernels\n");
-  cl_device_id dev = program->devices[device_i];
-
-  assert(program->build_status == CL_BUILD_NONE);
-
-  uint64_t builtins_file_len = 0;
-  char *builtins_file = NULL;
-  if (pocl_read_file(SRCDIR "/lib/CL/devices/tce/builtins.cl", &builtins_file,
-                     &builtins_file_len) < 0) {
-    POCL_MSG_ERR("TCE: can't find opencl builtins");
-    return -1;
-  }
-
-  program->source = builtins_file;
-
-  err = pocl_driver_build_source(program, device_i, 0, NULL, NULL, 1);
-  POCL_RETURN_ERROR_ON((err != CL_SUCCESS), CL_BUILD_PROGRAM_FAILURE,
-                       "failed to build OpenCL builtins for TCE\n");
-
-  return 0;
-}
 
 #define CHECK_AND_ALIGN_ARGBUFFER(DSIZE)                                      \
   do                                                                          \
@@ -751,10 +727,20 @@ pocl_tce_run(void *data, _cl_command_node* cmd)
         cmd->command.run.pc.local_size[1], d->needsByteSwap);
     temp_ctx.local_size[2] = pocl_byteswap_uint32_t(
         cmd->command.run.pc.local_size[2], d->needsByteSwap);
-    // currently unused by TCE
-    temp_ctx.printf_buffer = 0x11223344;
-    temp_ctx.printf_buffer_position = 0x9900ccaa;
-    temp_ctx.printf_buffer_capacity = 0x88776655;
+
+    temp_ctx.printf_buffer = pocl_byteswap_uint32_t(
+        d->printf_buffer->start_address, d->needsByteSwap);
+    temp_ctx.printf_buffer_capacity = pocl_byteswap_uint32_t(
+        cmd->device->printf_buffer_size, d->needsByteSwap);
+    temp_ctx.printf_buffer_position = pocl_byteswap_uint32_t(
+        d->printf_position_chunk->start_address, d->needsByteSwap);
+    d->writeWordToDevice(d->printf_position_chunk->start_address, 0);
+    POCL_MSG_PRINT_TCE(
+        "Device side printf buffer=%d, position: %d and capacity %d \n",
+        d->printf_buffer->start_address,
+        d->printf_position_chunk->start_address,
+        cmd->device->printf_buffer_size);
+
     POCL_MSG_PRINT_TCE("COPYING %u bytes to CONTEXT: %u \n",
                        (uint32_t)sizeof(struct pocl_context32),
                        (uint32_t)context->start_address);
@@ -827,6 +813,20 @@ pocl_tce_run(void *data, _cl_command_node* cmd)
 #endif
   /* We are done with this kernel, free the command queue entry. */
   d->writeWordToDevice(d->statusAddr, POCL_KST_FREE);
+
+  unsigned printf_position =
+      d->readWordFromDevice(d->printf_position_chunk->start_address);
+  POCL_MSG_PRINT_TCE(
+      "Device wrote %u bytes to printf, passing them to stdout now:\n",
+      printf_position);
+  if (printf_position > 0) {
+    char *tmp_printf_buf = new char[printf_position];
+    assert(tmp_printf_buf);
+    d->copyDeviceToHost(d->printf_buffer->start_address, tmp_printf_buf,
+                        printf_position);
+    write(STDOUT_FILENO, tmp_printf_buf, printf_position);
+    delete[] tmp_printf_buf;
+  }
 
   for (ChunkVector::iterator i = tempChunks.begin();
        i != tempChunks.end(); ++i) 

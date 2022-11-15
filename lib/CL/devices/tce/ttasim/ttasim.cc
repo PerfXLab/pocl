@@ -65,14 +65,15 @@
 #include "common_driver.h"
 
 #define DEFAULT_WG_SIZE 64
+#define MAX_WG_SIZE 4096
 
 using namespace TTAMachine;
 
 static void *pocl_ttasim_thread (void *p);
 
 #define TCE_BUILTIN_KERNELS 4
-static const char *TCEBuiltinKernels[TCE_BUILTIN_KERNELS] = {
-    "pocl.mul.i32", "pocl.add.i32", "pocl.copy.i8", "pocl.abs.f32"};
+static const char* TCEBuiltinKernels[TCE_BUILTIN_KERNELS] = {
+  "pocl.mul.i32", "pocl.add.i32", "pocl.copy.i8", "pocl.abs.f32" };
 
 void
 pocl_ttasim_init_device_ops(struct pocl_device_ops *ops)
@@ -108,7 +109,7 @@ pocl_ttasim_init_device_ops(struct pocl_device_ops *ops)
   ops->supports_binary = pocl_driver_supports_binary;
   ops->build_poclbinary = pocl_driver_build_poclbinary;
   ops->compile_kernel = pocl_tce_compile_kernel;
-  ops->build_builtin = pocl_tce_build_builtin;
+  ops->build_builtin = pocl_driver_build_opencl_builtins;
 
   // new driver api
   ops->join = pocl_tce_join;
@@ -626,10 +627,11 @@ pocl_ttasim_init (unsigned j, cl_device_id dev, const char* parameters)
 
   int max_wg
       = pocl_get_int_option ("POCL_MAX_WORK_GROUP_SIZE", DEFAULT_WG_SIZE);
-  assert (max_wg > 0);
-  max_wg = std::min (max_wg, DEFAULT_WG_SIZE);
   if (max_wg < 0)
     max_wg = DEFAULT_WG_SIZE;
+  if (max_wg > MAX_WG_SIZE)
+    max_wg = DEFAULT_WG_SIZE;
+
 
   dev->max_work_item_sizes[0] = dev->max_work_item_sizes[1]
       = dev->max_work_item_sizes[2] = dev->max_work_group_size = max_wg;
@@ -665,13 +667,15 @@ pocl_ttasim_init (unsigned j, cl_device_id dev, const char* parameters)
 
   dev->num_builtin_kernels = TCE_BUILTIN_KERNELS;
   // TODO refactor to pocl_util
-  dev->builtin_kernel_list = (char *)malloc(1024);
+  dev->builtin_kernel_list = (char*)malloc(1024);
   dev->builtin_kernel_list[0] = 0;
-  for (unsigned i = 0; i < TCE_BUILTIN_KERNELS; ++i) {
-    if (i > 0)
-      strcat(dev->builtin_kernel_list, ";");
-    strcat(dev->builtin_kernel_list, TCEBuiltinKernels[i]);
-  }
+  for (unsigned i = 0; i < TCE_BUILTIN_KERNELS; ++i)
+     {
+       if (i>0)
+         strcat(dev->builtin_kernel_list, ";");
+       strcat(dev->builtin_kernel_list, TCEBuiltinKernels[i]);
+     }
+  dev->builtins_sources_path = "builtins.cl";
 
   dev->available = CL_TRUE;
 #ifdef ENABLE_LLVM
@@ -719,6 +723,17 @@ pocl_ttasim_init (unsigned j, cl_device_id dev, const char* parameters)
   dev->mem_base_addr_align = 128;
   dev->min_data_type_align_size = 128;
 
+  dev->device_side_printf = 1;
+  dev->printf_buffer_size = PRINTF_BUFFER_SIZE;
+  TTASimDevice *d = (TTASimDevice *)dev->data;
+  d->printf_buffer =
+      pocl_alloc_buffer_from_region(&d->global_mem, dev->printf_buffer_size);
+  assert(d->printf_buffer);
+  d->printf_position_chunk = pocl_alloc_buffer_from_region(&d->global_mem, 4);
+  if (d->printf_position_chunk == NULL) {
+    POCL_ABORT("TTASIM: Can't allocate 4 bytes for printf index\n");
+  }
+  
   dev->max_parameter_size = 1024;
 
   return CL_SUCCESS;

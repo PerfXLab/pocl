@@ -32,14 +32,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "pocl-pthread_scheduler.h"
-#include "pocl_cl.h"
-#include "pocl-pthread.h"
-#include "pocl-pthread_utils.h"
-#include "utlist.h"
-#include "pocl_util.h"
+#include "builtin_kernels.hh"
 #include "common.h"
+#include "pocl-pthread.h"
+#include "pocl-pthread_scheduler.h"
+#include "pocl-pthread_utils.h"
+#include "pocl_cl.h"
 #include "pocl_mem_management.h"
+#include "pocl_util.h"
+#include "utlist.h"
+
 #ifdef __APPLE__
 #include "pthread_barrier.h"
 #endif
@@ -97,6 +99,10 @@ pthread_scheduler_init (cl_device_id device)
   POCL_FAST_INIT (scheduler.wq_lock_fast);
 
   PTHREAD_CHECK (pthread_cond_init (&(scheduler.wake_pool), NULL));
+
+  POCL_LOCK (scheduler.wq_lock_fast);
+  VG_ASSOC_COND_VAR (scheduler.wake_pool, scheduler.wq_lock_fast);
+  POCL_UNLOCK (scheduler.wq_lock_fast);
 
   scheduler.thread_pool = pocl_aligned_malloc (
       HOST_CPU_CACHELINE_SIZE,
@@ -370,6 +376,11 @@ pocl_pthread_prepare_kernel (void *data, _cl_command_node *cmd)
   kernel_run_command *run_cmd;
   cl_kernel kernel = cmd->command.run.kernel;
   struct pocl_context *pc = &cmd->command.run.pc;
+
+  char *saved_name = NULL;
+  pocl_sanitize_builtin_kernel_name (kernel, &saved_name);
+  pocl_check_kernel_dlhandle_cache (cmd, 1, 1);
+  pocl_restore_builtin_kernel_name (kernel, saved_name);
 
   size_t num_groups = pc->num_groups[0] * pc->num_groups[1] * pc->num_groups[2];
 

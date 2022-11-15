@@ -257,7 +257,7 @@ check_binary(cl_device_id device, const unsigned char *binary)
   uint64_t dev_id = pocl_binary_get_device_id(device);
   if (dev_id != b.device_id)
     {
-      POCL_MSG_WARN ("PoCLBinary device id mismatch, DEVICE: %lx, BINARY: %lx\n",
+      POCL_MSG_WARN ("PoCLBinary device id mismatch, DEVICE: %" PRIX64 ", BINARY: %" PRIX64 "\n",
                       dev_id, b.device_id);
       return NULL;
     }
@@ -409,7 +409,15 @@ pocl_binary_serialize_kernel_to_buffer(cl_program program,
       BUFFER_STORE(ai->type_qualifier, cl_kernel_arg_type_qualifier);
       BUFFER_STORE(ai->type, uint32_t);
       BUFFER_STORE (ai->type_size, uint32_t);
-      BUFFER_STORE_STR(ai->name);
+      if (meta->has_arg_metadata & POCL_HAS_KERNEL_ARG_NAME)
+        BUFFER_STORE_STR(ai->name);
+      else
+      {
+        char temp[2];
+        temp[0] = 'a' + i;
+        temp[1] = 0;
+        BUFFER_STORE_STR(temp);
+      }
       if (ai->type_name)
         BUFFER_STORE_STR(ai->type_name);
       else
@@ -452,7 +460,6 @@ deserialize_file (unsigned char* buffer,
 
   char* content = NULL;
   BUFFER_READ_STR2 (content, len);
-  assert (len > 0);
 
   char *p = basedir + offset;
   strcpy (p, relpath);
@@ -468,7 +475,10 @@ deserialize_file (unsigned char* buffer,
     pocl_mkdir_p (dirpath);
   free (dir);
 
-  pocl_write_file (fullpath, content, len, 0, 0);
+  if (len == 0)
+    pocl_touch_file (fullpath);
+  else
+    pocl_write_file (fullpath, content, len, 0, 0);
 
 RET:
   free (content);

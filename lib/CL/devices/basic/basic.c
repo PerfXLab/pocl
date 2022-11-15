@@ -23,6 +23,7 @@
 */
 
 #include "basic.h"
+#include "builtin_kernels.hh"
 #include "common.h"
 #include "config.h"
 #include "config2.h"
@@ -107,6 +108,7 @@ pocl_basic_init_device_ops(struct pocl_device_ops *ops)
   ops->supports_binary = pocl_driver_supports_binary;
   ops->build_poclbinary = pocl_driver_build_poclbinary;
   ops->compile_kernel = pocl_basic_compile_kernel;
+  ops->build_builtin = pocl_driver_build_opencl_builtins;
 
   ops->join = pocl_basic_join;
   ops->submit = pocl_basic_submit;
@@ -200,8 +202,7 @@ pocl_basic_init (unsigned j, cl_device_id device, const char* parameters)
 
   pocl_setup_extensions_with_version (device);
 
-  /* builtin kernels.. skip, basic/pthread doesn't have any
-  pocl_setup_builtin_kernels_with_version (device); */
+  pocl_setup_builtin_kernels_with_version (device);
 
   pocl_setup_ils_with_version (device);
 
@@ -261,6 +262,8 @@ pocl_basic_init (unsigned j, cl_device_id device, const char* parameters)
      basic devices can be still used for task level parallelism 
      using multiple OpenCL devices. */
   device->max_compute_units = 1;
+
+  fix_local_mem_size (device);
 
   return ret;
 }
@@ -360,15 +363,30 @@ pocl_basic_run (void *data, _cl_command_node *cmd)
         }
     }
 
-  if (!cmd->device->device_alloca_locals)
-    for (i = 0; i < meta->num_locals; ++i)
-      {
-        size_t s = meta->local_sizes[i];
-        size_t j = meta->num_args + i;
-        arguments[j] = malloc (sizeof (void *));
-        void *pp = pocl_aligned_malloc (MAX_EXTENDED_ALIGNMENT, s);
-        *(void **)(arguments[j]) = pp;
-      }
+  if (cmd->device->device_alloca_locals)
+    {
+      /* Local buffers are allocated in the device side work-group
+         launcher. Let's pass only the sizes of the local args in
+         the arg buffer. */
+      for (i = 0; i < meta->num_locals; ++i)
+        {
+          assert (sizeof (size_t) == sizeof (void *));
+          size_t s = meta->local_sizes[i];
+          size_t j = meta->num_args + i;
+          *(size_t *)(arguments[j]) = s;
+        }
+    }
+  else
+    {
+      for (i = 0; i < meta->num_locals; ++i)
+        {
+          size_t s = meta->local_sizes[i];
+          size_t j = meta->num_args + i;
+          arguments[j] = malloc (sizeof (void *));
+          void *pp = pocl_aligned_malloc (MAX_EXTENDED_ALIGNMENT, s);
+          *(void **)(arguments[j]) = pp;
+        }
+    }
 
   pc->printf_buffer = d->printf_buffer;
   assert (pc->printf_buffer != NULL);
@@ -580,8 +598,11 @@ void
 pocl_basic_compile_kernel (_cl_command_node *cmd, cl_kernel kernel,
                            cl_device_id device, int specialize)
 {
+  char *saved_name = NULL;
+  pocl_sanitize_builtin_kernel_name (kernel, &saved_name);
   if (cmd != NULL && cmd->type == CL_COMMAND_NDRANGE_KERNEL)
     pocl_check_kernel_dlhandle_cache (cmd, 0, specialize);
+  pocl_restore_builtin_kernel_name (kernel, saved_name);
 }
 
 /*********************** IMAGES ********************************/

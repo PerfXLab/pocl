@@ -403,6 +403,7 @@ pocl_calculate_kernel_hash (cl_program program, unsigned kernel_i,
   pocl_SHA1_Init (&hash_ctx);
 
   char *n = program->kernel_meta[kernel_i].name;
+  assert (n != NULL && program->build_hash[device_i] != NULL);
   pocl_SHA1_Update (&hash_ctx, (uint8_t *)program->build_hash[device_i],
                     sizeof (SHA1_digest_t));
   pocl_SHA1_Update (&hash_ctx, (uint8_t *)n, strlen (n));
@@ -568,13 +569,13 @@ setup_device_kernel_hashes (cl_program program)
 {
   cl_uint i, device_i;
 
-  if ((program->builtin_kernel_names != NULL) || (program->num_kernels == 0)
-      || (program->num_devices == 0))
+  if ((program->num_kernels == 0) || (program->num_devices == 0))
     return;
 
   assert (program->kernel_meta);
   for (i = 0; i < program->num_kernels; ++i)
     {
+      assert (program->kernel_meta[i].build_hash == NULL);
       program->kernel_meta[i].build_hash = (pocl_kernel_hash_t *)calloc (
           program->num_devices, sizeof (pocl_kernel_hash_t));
     }
@@ -711,6 +712,21 @@ compile_and_link_program(int compile_program,
       program->devices = unique_devlist;
     }
 
+  /* if program will be compiled using clCompileProgram its binary_type
+   * will be set to CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT.
+   *
+   * if program was created by clLinkProgram which is called
+   * with the –createlibrary link option its binary_type will be set to
+   * CL_PROGRAM_BINARY_TYPE_LIBRARY.
+   */
+  program->binary_type = CL_PROGRAM_BINARY_TYPE_EXECUTABLE;
+  if (create_library)
+    program->binary_type = CL_PROGRAM_BINARY_TYPE_LIBRARY;
+  if (compile_program && !link_program)
+    program->binary_type = CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT;
+  if (program->num_builtin_kernels > 0)
+    program->binary_type = CL_PROGRAM_BINARY_TYPE_NONE;
+
   POCL_MSG_PRINT_LLVM ("building program for %u devs with options %s\n",
                        num_devices, program->compiler_options);
 
@@ -811,7 +827,8 @@ compile_and_link_program(int compile_program,
                                       device->long_name);
 
           if ((program->binary_sizes[device_i] == 0)
-              && (program->pocl_binary_sizes[device_i] == 0))
+              && (program->pocl_binary_sizes[device_i] == 0)
+              && (program->program_il_size == 0))
             APPEND_TO_BUILD_LOG_GOTO (CL_INVALID_BINARY,
                                       "No poclbinaries nor binaries "
                                       "for device %s - can't build "
@@ -843,38 +860,25 @@ compile_and_link_program(int compile_program,
       ++actually_built;
     }
   assert (actually_built == program->num_devices);
-
-  program->binary_type = CL_PROGRAM_BINARY_TYPE_EXECUTABLE;
-  /* if program will be compiled using clCompileProgram its binary_type
-   * will be set to CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT.
-   *
-   * if program was created by clLinkProgram which is called
-   * with the –createlibrary link option its binary_type will be set to
-   * CL_PROGRAM_BINARY_TYPE_LIBRARY.
-   */
-  if (create_library)
-    program->binary_type = CL_PROGRAM_BINARY_TYPE_LIBRARY;
-  if (compile_program && !link_program)
-    program->binary_type = CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT;
-
   assert(program->num_kernels == 0);
 
-  if (program->binary_type != CL_PROGRAM_BINARY_TYPE_EXECUTABLE)
+  /* for executables & programs with builtin kernels,
+   * setup the kernel metadata */
+  /* if the program is not a finished executable, we don't need
+   * to setup kernel metadata */
+  if (program->binary_type == CL_PROGRAM_BINARY_TYPE_EXECUTABLE
+      || program->binary_type == CL_PROGRAM_BINARY_TYPE_NONE)
     {
-      program->build_status = CL_BUILD_SUCCESS;
-      errcode = CL_SUCCESS;
-      goto FINISH;
-    }
+      errcode = setup_kernel_metadata (program);
+      if (errcode != CL_SUCCESS)
+        {
+          POCL_MSG_ERR ("Program build: kernel metadata setup failed\n");
+          goto ERROR;
+        }
 
-  errcode = setup_kernel_metadata (program);
-  if (errcode != CL_SUCCESS)
-    {
-      POCL_MSG_ERR ("Program build: kernel metadata setup failed\n");
-      goto ERROR;
+      if (program->builtin_kernel_names == NULL)
+        setup_device_kernel_hashes (program);
     }
-
-  if (program->builtin_kernel_names == NULL)
-    setup_device_kernel_hashes (program);
 
   for (device_i = 0; device_i < program->num_devices; device_i++)
     {

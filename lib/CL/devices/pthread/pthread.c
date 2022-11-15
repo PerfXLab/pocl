@@ -155,8 +155,7 @@ pocl_pthread_init (unsigned j, cl_device_id device, const char* parameters)
 
   pocl_setup_extensions_with_version (device);
 
-  /* builtin kernels.. skip, basic/pthread doesn't have any
-  pocl_setup_builtin_kernels_with_version (device); */
+  pocl_setup_builtin_kernels_with_version (device);
 
   pocl_setup_ils_with_version (device);
 
@@ -209,6 +208,8 @@ pocl_pthread_init (unsigned j, cl_device_id device, const char* parameters)
 
   pocl_cpuinfo_detect_device_info(device);
   pocl_set_buffer_image_limits(device);
+
+  fix_local_mem_size (device);
 
   /* in case hwloc doesn't provide a PCI ID, let's generate
      a vendor id that hopefully is unique across vendors. */
@@ -382,6 +383,8 @@ pocl_pthread_update_event (cl_device_id device, cl_event event)
 
       PTHREAD_CHECK (pthread_cond_init (&e_d->event_cond, NULL));
       event->data = (void *) e_d;
+
+      VG_ASSOC_COND_VAR (e_d->event_cond, event->pocl_lock);
     }
 }
 
@@ -412,6 +415,11 @@ pocl_pthread_init_queue (cl_device_id device, cl_command_queue queue)
       = pocl_aligned_malloc (HOST_CPU_CACHELINE_SIZE, sizeof (pthread_cond_t));
   pthread_cond_t *cond = (pthread_cond_t *)queue->data;
   PTHREAD_CHECK (pthread_cond_init (cond, NULL));
+
+  POCL_LOCK_OBJ (queue);
+  VG_ASSOC_COND_VAR ((*cond), queue->pocl_lock);
+  POCL_UNLOCK_OBJ (queue);
+
   return CL_SUCCESS;
 }
 

@@ -3,7 +3,7 @@
 #cmakedefine BUILD_CUDA
 #cmakedefine BUILD_BASIC
 #cmakedefine BUILD_PTHREAD
-#cmakedefine BUILD_ACCEL
+#cmakedefine BUILD_ALMAIF
 #cmakedefine BUILD_VULKAN
 
 #cmakedefine BUILD_PROXY
@@ -53,6 +53,8 @@
 
 #cmakedefine ENABLE_SPIRV
 
+#cmakedefine ENABLE_VALGRIND
+
 #cmakedefine HAVE_DLFCN_H
 
 #cmakedefine HAVE_FORK
@@ -86,7 +88,7 @@
 
 #cmakedefine HAVE_UTIME
 
-#cmakedefine HAVE_VALGRIND
+#cmakedefine HAVE_XRT
 
 #cmakedefine ENABLE_LLVM
 

@@ -48,6 +48,56 @@ IGNORE_COMPILER_WARNING("-Wunused-parameter")
 
 using namespace llvm;
 
+#ifndef LLVM_OPAQUE_POINTERS
+static inline bool is_image_type(const llvm::Type &t) {
+  if (t.isPointerTy() && t.getPointerElementType()->isStructTy()) {
+    llvm::StringRef name = t.getPointerElementType()->getStructName();
+    if (name.startswith("opencl.image2d_") ||
+        name.startswith("opencl.image3d_") ||
+        name.startswith("opencl.image1d_") ||
+        name.startswith("struct._pocl_image"))
+      return true;
+  }
+  return false;
+}
+
+static inline bool is_sampler_type(const llvm::Type &t) {
+  if (t.isPointerTy() && t.getPointerElementType()->isStructTy()) {
+    llvm::StringRef name = t.getPointerElementType()->getStructName();
+    if (name.startswith("opencl.sampler_t"))
+      return true;
+  }
+  return false;
+}
+#else
+static inline bool is_image_type(struct pocl_argument_info &ArgInfo,
+                                 cl_bitfield has_arg_meta) {
+  if (ArgInfo.type == POCL_ARG_TYPE_POINTER) {
+    //    assert(has_arg_meta & POCL_HAS_KERNEL_ARG_ADDRESS_QUALIFIER);
+
+    assert(has_arg_meta & POCL_HAS_KERNEL_ARG_TYPE_NAME);
+    llvm::StringRef name(ArgInfo.type_name);
+    if ((has_arg_meta & POCL_HAS_KERNEL_ARG_ACCESS_QUALIFIER) &&
+        (ArgInfo.access_qualifier != CL_KERNEL_ARG_ACCESS_NONE)) {
+      if (name.startswith("image2d_") || name.startswith("image3d_") ||
+          name.startswith("image1d_") || name.startswith("_pocl_image"))
+        return true;
+    }
+  }
+  return false;
+}
+
+static inline bool is_sampler_type(struct pocl_argument_info &ArgInfo,
+                                   cl_bitfield has_arg_meta) {
+  assert(has_arg_meta & POCL_HAS_KERNEL_ARG_TYPE_NAME);
+  llvm::StringRef name(ArgInfo.type_name);
+  if (name.equals("sampler_t"))
+    return true;
+  else
+    return false;
+}
+#endif
+
 // The old way of getting kernel metadata from "opencl.kernels" module meta.
 // LLVM < 3.9 and SPIR
 static int pocl_get_kernel_arg_module_metadata(llvm::Function *Kernel,
@@ -182,6 +232,26 @@ static int pocl_get_kernel_arg_module_metadata(llvm::Function *Kernel,
         std::cout << "UNKNOWN opencl metadata class for: " << meta_name
                   << std::endl;
     }
+
+#ifndef LLVM_OLDER_THAN_10_0
+    bool has_name_metadata = true;
+    if ((kernel_meta->has_arg_metadata & POCL_HAS_KERNEL_ARG_NAME) == 0) {
+      for (unsigned j = 0; j < arg_num; ++j) {
+        struct pocl_argument_info *current_arg = &kernel_meta->arg_info[j];
+        Argument* Arg = Kernel->getArg(j);
+        if (Arg->hasName()) {
+          const char *ArgName = Arg->getName().data();
+          current_arg->name = strdup(ArgName);
+        } else {
+          has_name_metadata = false;
+          break;
+        }
+      }
+      if (has_name_metadata)
+        kernel_meta->has_arg_metadata |= POCL_HAS_KERNEL_ARG_NAME;
+    }
+#endif
+
   }
   return 0;
 }
@@ -506,7 +576,8 @@ int pocl_llvm_get_kernels_metadata(cl_program program, unsigned device_i) {
     llvm::Function *KernelFunction = kernels[j];
 
     meta->num_args = KernelFunction->arg_size();
-    meta->name = strdup(KernelFunction->getName().str().c_str());
+    std::string funcName = KernelFunction->getName().str();
+    meta->name = strdup(funcName.c_str());
 
     if (pocl_get_kernel_arg_function_metadata(KernelFunction, input, meta)) {
       return CL_INVALID_KERNEL;
@@ -519,8 +590,6 @@ int pocl_llvm_get_kernels_metadata(cl_program program, unsigned device_i) {
 #endif
 
     locals.clear();
-
-    std::string funcName = KernelFunction->getName().str();
 
     for (llvm::Module::global_iterator i = input->global_begin(),
                                        e = input->global_end();
@@ -559,11 +628,21 @@ int pocl_llvm_get_kernels_metadata(cl_program program, unsigned device_i) {
         // index 0 is for function attributes, parameters start at 1.
         // TODO: detect the address space from MD.
       }
-      if (pocl::is_image_type(*t)) {
+#ifndef LLVM_OPAQUE_POINTERS
+      if (is_image_type(*t)) {
         ArgInfo.type = POCL_ARG_TYPE_IMAGE;
-      } else if (pocl::is_sampler_type(*t)) {
+      }
+      if (is_sampler_type(*t)) {
         ArgInfo.type = POCL_ARG_TYPE_SAMPLER;
       }
+#else
+      if (is_image_type(ArgInfo, meta->has_arg_metadata)) {
+        ArgInfo.type = POCL_ARG_TYPE_IMAGE;
+      }
+      if (is_sampler_type(ArgInfo, meta->has_arg_metadata)) {
+        ArgInfo.type = POCL_ARG_TYPE_SAMPLER;
+      }
+#endif
       i++;
     }
 
